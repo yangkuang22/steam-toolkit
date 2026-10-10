@@ -39,6 +39,24 @@ steam_running() {
     return 1
 }
 
+# 黑匣子：SLSsteam 每次加载都会清空 ~/.SLSsteam.log，Steam 自己的日志也会轮换，
+# 偶发故障（如冷启动卡转圈）的现场下次一启动就没了。所以真正启动前先把上一次会话的
+# 日志压缩存到 logs/blackbox/<时间>/，保留最近 8 份。任何失败都忽略，不影响启动。
+blackbox() {
+    [ -d "$SUOS_DIR/logs" ] || return 0
+    local bb="$SUOS_DIR/logs/blackbox" sl="$HOME/.local/share/Steam/logs" dst f
+    dst="$bb/$(date '+%Y%m%d-%H%M%S')"
+    mkdir -p "$dst" || return 0
+    [ -s "$HOME/.SLSsteam.log" ] && gzip -c "$HOME/.SLSsteam.log" > "$dst/SLSsteam.log.gz"
+    for f in webhelper_js console_log content_log bootstrap_log webhelper connection_log; do
+        [ -s "$sl/$f.txt" ] && tail -c 2097152 "$sl/$f.txt" | gzip > "$dst/$f.txt.gz"
+    done
+    ls -1d "$bb"/*/ 2>/dev/null | head -n -8 | xargs -r rm -rf
+}
+
+# 只在真正启动时存（转发 steam:// URL 的调用不存，否则会把现场冲掉）
+steam_running || { blackbox 2>/dev/null || :; }
+
 # 手动跳过注入
 if [ "${SLS_NOINJECT:-0}" = "1" ]; then
     log "SLS_NOINJECT=1 → 不带注入启动"
