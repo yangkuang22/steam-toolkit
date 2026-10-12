@@ -326,60 +326,97 @@ class TestSLSConfigToml(unittest.TestCase):
 
 
 # ══════════════════════════════════════════════════════════════
-#  P2-4  批量写入
+#  config.toml：所有权只走 Lua，toml 只做旧版残留清理
 # ══════════════════════════════════════════════════════════════
 
-class TestBatchToml(TempCorePaths):
-    """P2-4: 批量接口的行为与性能"""
+def _toml_list(field: str) -> list[str]:
+    m = re.search(rf"^{field} = \[([^\]]*)\]", core.SLS_TOML.read_text(), re.M)
+    return [x.strip() for x in m.group(1).split(",") if x.strip()] if m else []
 
-    def _appids(self) -> list[str]:
-        text = core.SLS_TOML.read_text()
-        m = re.search(r"^AppIds = \[([^\]]*)\]", text, re.M)
-        return [x.strip() for x in m.group(1).split(",") if x.strip()] if m else []
 
-    def test_batch_add(self):
-        n = core._add_appids_to_toml([9001, 9002, 9003])
-        self.assertEqual(n, 6, "两个列表各加 3 个 = 6")
-        ids = self._appids()
-        for x in ("9001", "9002", "9003"):
-            self.assertIn(x, ids)
+def _seed_toml(ids) -> None:
+    s = ", ".join(str(i) for i in ids)
+    core.SLS_TOML.write_text(f"UseWhitelist = false\nAppIds = [{s}]\nAdditionalApps = [{s}]\n")
 
-    def test_batch_idempotent(self):
-        core._add_appids_to_toml([9001, 9002])
-        n = core._add_appids_to_toml([9001, 9002])
-        self.assertEqual(n, 0)
 
-    def test_batch_empty(self):
-        self.assertEqual(core._add_appids_to_toml([]), 0)
+class TestTomlCleanup(TempCorePaths):
+    """旧版把每个游戏和 DLC 同时写进 AppIds（UseWhitelist=false 时是黑名单）和
+    AdditionalApps。新版不再写入，只保留清理能力。"""
 
-    def test_single_wrapper(self):
-        core._add_appid_to_toml(9500)
-        self.assertIn("9500", self._appids())
+    def test_remove_from_both_lists(self):
+        _seed_toml([100, 200, 300])
+        self.assertEqual(core._remove_appids_from_toml([100, 300]), 4)
+        self.assertEqual(_toml_list("AppIds"), ["200"])
+        self.assertEqual(_toml_list("AdditionalApps"), ["200"])
+        self.assertIn("UseWhitelist = false", core.SLS_TOML.read_text(), "其他设置不能丢")
 
-    def test_batch_writes_once(self):
-        """批量接口应该只写一次文件"""
-        writes = []
-        orig = core.SLS_TOML
+    def test_remove_absent_does_not_write(self):
+        _seed_toml([100])
+        before = core.SLS_TOML.read_text()
+        mtime = core.SLS_TOML.stat().st_mtime_ns
+        self.assertEqual(core._remove_appids_from_toml([999]), 0)
+        self.assertEqual(core.SLS_TOML.read_text(), before)
+        self.assertEqual(core.SLS_TOML.stat().st_mtime_ns, mtime, "没变化就不该重写（会触发 SLSsteam 热重载）")
 
-        class Spy(type(orig)):  # type: ignore[misc]
-            pass
+    def test_cleanup_only_removes_lua_covered(self):
+        _seed_toml([100, 101, 300])
+        (core.LUA_SLS / "100.lua").write_text(
+            f'addappid(100)\naddappid(101,0,"{"ab" * 32}")\nsetManifestid(101,"5")\n')
+        self.assertEqual(core.cleanup_legacy_toml_lists(), 4)
+        self.assertEqual(_toml_list("AppIds"), ["300"], "不在 Lua 里的条目不能动")
+        self.assertEqual(_toml_list("AdditionalApps"), ["300"])
 
-        # 更简单: 用 mtime/inode 计数不靠谱，改成统计 write_text 调用
-        real_write = Path.write_text
-        count = {"n": 0}
 
-        def counting_write(self, *a, **kw):
-            if self == core.SLS_TOML:
-                count["n"] += 1
-            return real_write(self, *a, **kw)
+class TestSLSConfigOwnedFromLua(unittest.TestCase):
+    """toml 列表清空后，status/list 显示的"已拥有"要来自 Lua"""
 
-        Path.write_text = counting_write  # type: ignore[method-assign]
-        try:
-            core._add_appids_to_toml(list(range(7000, 7100)))
-        finally:
-            Path.write_text = real_write  # type: ignore[method-assign]
-        self.assertEqual(count["n"], 1,
-                         f"100 个 appid 应该只写 1 次，实际 {count['n']} 次")
+    def test_owned_includes_lua(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            toml = Path(tmp) / "config.toml"
+            toml.write_text("AppIds = []\nAdditionalApps = [730]\n")
+            lua = Path(tmp) / "lua"
+            lua.mkdir()
+            (lua / "100.lua").write_text(f'addappid(100)\naddappid(101,0,"{"ab" * 32}")\n')
+            self.assertEqual(slsconfig.SLSConfig(toml, lua_dir=lua).owned(), {100, 101, 730})
+
+
+class TestDepotcacheCleanScope(unittest.TestCase):
+    """清理器只能清理本工具 Lua 管理的 depot 的旧版本。
+    旧版把僵尸毁灭工程的 111 个创意工坊清单（<appid>_<gid>.manifest）当垃圾删了。"""
+
+    def setUp(self) -> None:
+        from suos import depotcache_clean as dc
+        self.dc = dc
+        self._tmp = tempfile.TemporaryDirectory()
+        t = Path(self._tmp.name)
+        self._orig = (dc.DEPOTCACHE, dc.ACF_DIR, dc.LUA_DIRS)
+        dc.DEPOTCACHE, dc.ACF_DIR, dc.LUA_DIRS = t / "depotcache", t / "steamapps", [t / "lua"]
+        for d in (dc.DEPOTCACHE, dc.ACF_DIR / "workshop", t / "lua"):
+            d.mkdir(parents=True)
+        (t / "lua" / "1000.lua").write_text('addappid(1000)\nsetManifestid(1001,"2")\n')
+        (dc.ACF_DIR / "appmanifest_1000.acf").write_text(
+            '"AppState"\n{\n\t"InstalledDepots"\n\t{\n\t\t"1001"\n\t\t{\n\t\t\t"manifest"\t\t"2"\n\t\t}\n\t}\n}\n')
+        (dc.ACF_DIR / "workshop" / "appworkshop_108600.acf").write_text(
+            '"AppWorkshop"\n{\n\t"WorkshopItemsInstalled"\n\t{\n\t\t"123456"\n\t\t{\n'
+            '\t\t\t"manifest"\t\t"555"\n\t\t}\n\t}\n}\n')
+        for name in ("1001_1", "1001_2", "108600_555", "108600_556", "2001_9"):
+            (dc.DEPOTCACHE / f"{name}.manifest").write_bytes(b"x")
+
+    def tearDown(self) -> None:
+        self.dc.DEPOTCACHE, self.dc.ACF_DIR, self.dc.LUA_DIRS = self._orig
+        self._tmp.cleanup()
+
+    def test_only_old_versions_of_managed_depots(self):
+        deletable, keeping, _ = self.dc.scan()
+        self.assertEqual(sorted(f.name for f in deletable), ["1001_1.manifest"])
+        kept = {f.name for f in keeping}
+        self.assertIn("108600_555.manifest", kept, "创意工坊清单不能删")
+        self.assertIn("108600_556.manifest", kept, "非本工具管理的 depot 不能删")
+        self.assertIn("2001_9.manifest", kept, "正版游戏的 depot 不能删")
+        self.assertIn("1001_2.manifest", kept, "Lua pin 的当前版本不能删")
+
+    def test_workshop_manifests_protected(self):
+        self.assertIn("108600_555", self.dc.protected())
 
 
 if __name__ == "__main__":
@@ -494,7 +531,7 @@ class TestUninstallRemovesDlc(TempCorePaths):
     def test_uninstall_removes_dlc_from_toml(self):
         """★ 核心: 卸载后 DLC appid 也要从 config.toml 消失"""
         appid = 8888002
-        core._add_appids_to_toml([appid, 9000001, 9000002])
+        _seed_toml([appid, 9000001, 9000002])     # 旧版入库留下的残留
         (core.LUA_SLS / f"{appid}.lua").write_text(
             f"addappid({appid})\n\n-- DLC\naddappid(9000001)\naddappid(9000002)\n")
         before = self._toml_appids()
@@ -512,7 +549,7 @@ class TestUninstallRemovesDlc(TempCorePaths):
     def test_uninstall_keeps_other_games(self):
         """卸载一个游戏不能影响别的"""
         keep = 8888003
-        core._add_appids_to_toml([keep, 8888004])
+        _seed_toml([keep, 8888004])
         (core.LUA_SLS / f"{keep}.lua").write_text(f"addappid({keep})\n")
         (core.LUA_SLS / "8888004.lua").write_text("addappid(8888004)\n")
 
@@ -939,6 +976,46 @@ class TestNameFallbackHeals(TempCorePaths):
         if core.RECORD.is_file():
             rec = json.loads(core.RECORD.read_text(encoding="utf-8"))
             self.assertNotIn(str(appid), rec, "失败的入库不该写进 installed.json")
+        # Lua 就是所有权：失败的新游戏不能有 Lua，否则它会出现在库里
+        self.assertFalse((core.LUA_SLS / f"{appid}.lua").exists(), "失败的入库不该写 Lua")
+
+    def _install_with(self, appid: int, lua: str, manifests: list[str]):
+        from suos import multisource, updater
+        orig_ms, orig_gids, orig_dc = multisource.resolve, updater.latest_gids, core.DEPOTCACHE
+        core.DEPOTCACHE = self.tmp / f"depotcache-{appid}"
+        core.DEPOTCACHE.mkdir(parents=True, exist_ok=True)
+        for name in manifests:
+            (core.DEPOTCACHE / name).write_bytes(b"\xd0\x17\xf6\x71stub")
+        multisource.resolve = lambda a, verbose=False: {
+            "appid": a, "name": "测试游戏", "keys": {}, "manifests": [], "lua": lua, "sources": {}}
+        updater.latest_gids = lambda a, timeout=25: {}
+        self._resolver("测试游戏")
+        try:
+            return core.install(appid, include_dlc=False)
+        finally:
+            multisource.resolve, updater.latest_gids, core.DEPOTCACHE = orig_ms, orig_gids, orig_dc
+
+    def test_install_writes_lua_not_toml(self) -> None:
+        """所有权只走 Lua：成功入库写 Lua，config.toml 一个字节都不改"""
+        _seed_toml([555])
+        before = core.SLS_TOML.read_text()
+        appid = 7780001
+        r = self._install_with(appid, f'addappid({appid})\naddappid(7780002,0,"{"ab" * 32}")\n'
+                                      f'setManifestid(7780002,"77")\n', ["7780002_77.manifest"])
+        self.assertTrue(r["ok"], r)
+        self.assertTrue((core.LUA_SLS / f"{appid}.lua").is_file())
+        self.assertTrue((core.LUA_STEAM / f"{appid}.lua").is_file())
+        self.assertEqual(core.SLS_TOML.read_text(), before, "入库不该再写 config.toml")
+
+    def test_failed_install_keeps_existing_lua(self) -> None:
+        """已有游戏重新入库失败（清单缺失）时，原来能用的 Lua 必须原封不动"""
+        appid = 7781001
+        old = f'addappid({appid})\naddappid(7781002,0,"{"ab" * 32}")\nsetManifestid(7781002,"1")\n'
+        (core.LUA_SLS / f"{appid}.lua").write_text(old)
+        r = self._install_with(appid, f'addappid({appid})\naddappid(7781002,0,"{"ab" * 32}")\n'
+                                      f'setManifestid(7781002,"999999999999999998")\n', [])
+        self.assertFalse(r["ok"])
+        self.assertEqual((core.LUA_SLS / f"{appid}.lua").read_text(), old, "失败时不能覆盖可用的 Lua")
 
 
 # ══════════════════════════════════════════════════════════════

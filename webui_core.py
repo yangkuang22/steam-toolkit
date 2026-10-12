@@ -573,57 +573,55 @@ def _depots_needing_placeholder(r: dict) -> list[int]:
     return sorted(set(out))
 
 
-def _add_appids_to_toml(appids: list[int] | int) -> int:
-    """把一批 appid 加进 config.toml 的 AppIds / AdditionalApps（只增）。
+# 所有权只走 Lua（addappid）。config.toml 的 AppIds / AdditionalApps 不再写入：
+#   · UseWhitelist=false（默认）时 AppIds 是【黑名单】，往里写等于把游戏拉黑，
+#     只是碰巧被 AdditionalApps 覆盖才没出事；
+#   · AdditionalApps 按 SLSsteam 官方说明只该用于"库里没有的游戏"，且它会和 Lua
+#     重复注入同一批 appid。
+# 旧版把每个游戏和 DLC 同时写进了这两个列表，下面只保留"移除"能力用于清理残留。
 
-    一次读、一次写 —— 旧版每个 appid 都要读+写整个文件，
-    入库一个 253 DLC 的游戏会做 508 次文件操作。
+def _remove_appids_from_toml(appids) -> int:
+    """从 config.toml 的 AppIds / AdditionalApps 移除这些 appid，返回移除的条目数。
 
-    返回实际新增的 appid 数量（两个列表都算）。
+    原子替换写入：SLSsteam 会监视 config.toml 并热重载，直接截断重写可能让它
+    读到半个文件 → 列表瞬间变空 → 运行中的所有权被撤销。
     """
     if not SLS_TOML.is_file():
         return 0
-    if isinstance(appids, int):
-        appids = [appids]
-    want = [str(a) for a in appids]
-    if not want:
+    drop = {str(a) for a in appids}
+    if not drop:
         return 0
-
     text = SLS_TOML.read_text()
-    added = 0
+    removed = 0
     for field in ("AppIds", "AdditionalApps"):
         m = re.search(rf"^{field} = \[([^\]]*)\]", text, re.M)
         if not m:
             continue
         items = [x.strip() for x in m.group(1).split(",") if x.strip()]
-        have = set(items)
-        new = [x for x in want if x not in have]
-        if not new:
+        kept = [x for x in items if x not in drop]
+        if len(kept) == len(items):
             continue
-        items.extend(new)
-        text = text[:m.start()] + f"{field} = [{', '.join(items)}]" + text[m.end():]
-        added += len(new)
-    SLS_TOML.write_text(text)
-    return added
+        removed += len(items) - len(kept)
+        text = text[:m.start()] + f"{field} = [{', '.join(kept)}]" + text[m.end():]
+    if removed:
+        tmp = SLS_TOML.with_suffix(".toml.tmp")
+        tmp.write_text(text)
+        tmp.replace(SLS_TOML)
+    return removed
 
 
-def _add_appid_to_toml(appid: int) -> None:
-    """单个 appid 的兼容包装（内部走批量接口）"""
-    _add_appids_to_toml([appid])
+def cleanup_legacy_toml_lists() -> int:
+    """一次性迁移：把旧版写进 AppIds / AdditionalApps、且已由我们 Lua 覆盖的 appid 移除。
 
-
-def _remove_appid_from_toml(appid: int) -> None:
-    if not SLS_TOML.is_file():
-        return
-    text = SLS_TOML.read_text()
-    for field in ("AppIds", "AdditionalApps"):
-        m = re.search(rf"^{field} = \[([^\]]*)\]", text, re.M)
-        if not m:
-            continue
-        items = [x.strip() for x in m.group(1).split(",") if x.strip()]
-        items = [x for x in items if x != str(appid)]
-        text = text[:m.start()] + f"{field} = [{', '.join(items)}]" + text[m.end():]
-    SLS_TOML.write_text(text)
+    只移除 Lua 里 addappid 过的 appid（解锁本来就由 Lua 负责），不碰其他条目。
+    """
+    covered: set[int] = set()
+    for d in (LUA_SLS, LUA_STEAM):
+        if d.is_dir():
+            for f in d.glob("*.lua"):
+                covered.update(int(x) for x in re.findall(
+                    r"addappid\(\s*(\d+)", f.read_text(errors="replace")))
+    return _remove_appids_from_toml(covered)
 
 
 def install(appid: int, include_dlc: bool = False) -> dict:
@@ -633,7 +631,8 @@ def install(appid: int, include_dlc: bool = False) -> dict:
       致命（任一失败 → ok=False）: 解析数据 / 备份 / 密钥 / Lua / 校验
       可选（失败只警告 → ok 仍可为 True）:
         清单（只有当 Lua 里没有 manifest 时才算致命）
-        DLC 查询 / config.toml / 处理记录
+        DLC 查询 / 处理记录
+    所有权只由 Lua（addappid）承担，不写 config.toml。
     """
     from suos import multisource
 
@@ -872,7 +871,12 @@ def install(appid: int, include_dlc: bool = False) -> dict:
                 except Exception:
                     pass
 
-        if not res["fatal"] or old_lua.is_file():
+        # ★ Lua 就是所有权：有致命失败（尤其清单缺失）时一个字都不写。
+        #   新游戏 → 不出现在库里，不会让用户点进必坏的下载；
+        #   已有游戏 → 保留原来能用的 Lua，不被半成品覆盖。
+        if res["fatal"]:
+            res["steps"].append("（有致命失败，未写入/未改动 Lua，避免交付必坏配置）")
+        else:
             try:
                 LUA_SLS.mkdir(parents=True, exist_ok=True)
                 LUA_STEAM.mkdir(parents=True, exist_ok=True)
@@ -882,19 +886,6 @@ def install(appid: int, include_dlc: bool = False) -> dict:
                                     + (f"，含 {len(dlcs)} 个 DLC" if dlcs else ""))
             except Exception as exc:  # noqa: BLE001
                 fatal(f"写 Lua 失败: {str(exc)[:100]}")
-
-    # ── 6. AppIds（可选）—— 一次读写搞定本体 + 全部 DLC ──
-    #   ★ 有致命失败（尤其清单缺失）时不授予所有权：否则游戏会出现在库里、
-    #     用户一点安装就走进必坏的下载流程。宁可此刻不显示，也不显示一个下不动的。
-    if res["fatal"]:
-        res["steps"].append("（有致命失败，跳过写 config.toml 的所有权，避免交付必坏配置）")
-    else:
-        try:
-            n_added = _add_appids_to_toml([appid, *dlcs])
-            res["steps"].append(f"✓ 加入 config.toml 的 AppIds（新增 {n_added} 项"
-                                + (f"，含 {len(dlcs)} 个 DLC" if dlcs else "") + "）")
-        except Exception as exc:  # noqa: BLE001
-            warn(f"写 config.toml 失败: {str(exc)[:60]}")
 
     # ── 7. 校验（致命）──
     try:
@@ -1077,8 +1068,8 @@ def _dlc_appids_from_lua(appid: int) -> list[int]:
         addappid(1753180)
         addappid(1753181)
         ...
-    这些 appid 也要在卸载时一并从 config.toml 移除，
-    否则 Steam 依然认为你拥有它们（库里会留下 DLC 孤儿）。
+    卸载时用它清理旧版残留在 config.toml 里的 DLC appid
+    （旧版入库会把 DLC 写进 config.toml，残留会让库里留下 DLC 孤儿）。
 
     只取 `-- DLC` 标记之后的裸 addappid，避免误删别的游戏。
     """
@@ -1103,7 +1094,7 @@ def _dlc_appids_from_lua(appid: int) -> list[int]:
 
 
 def uninstall(appid: int, remove_local: bool = False) -> dict:
-    """卸载：删 Lua、从 config.toml 移除（含 DLC）、清理 Steam 缓存残留。
+    """卸载：删 Lua（所有权随之撤销，含 DLC）、清理 config.toml 旧版残留、清理 Steam 缓存残留。
 
     密钥保留（无害，且避免误删别的游戏共用的 depot）。
 
@@ -1128,19 +1119,15 @@ def uninstall(appid: int, remove_local: bool = False) -> dict:
             f.unlink()
             res["steps"].append(f"✓ 删除 {f}")
 
-    _remove_appid_from_toml(appid)
-    res["steps"].append("✓ 从 config.toml 移除本体")
-
-    # ★ 一并移除 DLC（否则库里会留下 DLC 孤儿）
+    # 清理旧版写进 config.toml 的残留（本体 + DLC；新版入库不再写 toml）
+    try:
+        n = _remove_appids_from_toml([appid, *dlcs])
+        if n:
+            res["steps"].append(f"✓ 清理 config.toml 旧版残留 {n} 项")
+    except Exception as exc:  # noqa: BLE001
+        res["steps"].append(f"⚠ 清理 config.toml 残留失败: {str(exc)[:60]}")
     if dlcs:
-        removed = 0
-        for d in dlcs:
-            try:
-                _remove_appid_from_toml(d)
-                removed += 1
-            except Exception:
-                pass
-        res["steps"].append(f"✓ 同时移除 {removed} 个 DLC appid")
+        res["steps"].append(f"✓ 同时移除 {len(dlcs)} 个 DLC（随 Lua 一起删除）")
 
     try:
         _record_remove(appid)

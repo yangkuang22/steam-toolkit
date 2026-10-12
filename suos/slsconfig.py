@@ -1,12 +1,11 @@
-"""SLSsteam 配置【只读】查询（`~/.config/SLSsteam/config.toml`）。
+"""SLSsteam 所有权【只读】查询（供 `status` / `plan` / `list` 显示"已声明拥有"）。
 
-为什么需要这一层：SLSsteam 的"拥有权"完全由配置驱动——源码
-`Apps::checkAppOwnership()` 里就一句 `if (!g_config.isAddedAppId(appId)) return false;`，
-`isAddedAppId` 读的是 `AppIds` + `AdditionalApps` 两个列表。
+SLSsteam 的已拥有集合 = config.toml 的 AdditionalApps ∪ Lua 里的 addappid
+（源码 config.cpp: reconcileIntoConfig）。本工具入库只写 Lua，config.toml 的
+AppIds / AdditionalApps 只可能是旧版残留或用户手动条目，所以两处都读。
+注意 UseWhitelist=false 时 AppIds 其实是黑名单，这里沿用旧口径一并计入，仅供显示。
 
-本模块只负责【读】这两个列表（供 `status` / `plan` / `list` 显示"已声明拥有"）。
-实际的入库写入全部由 `webui_core.install()` 完成——它直接写 `config.toml`
-（SLSsteam 现用格式）和 `config.vdf`（Steam 的 depot 密钥）。
+实际的入库写入全部由 `webui_core.install()` 完成（Lua + config.vdf 密钥）。
 
 历史说明：早期版本这里有一整套写 `config.yaml` 的方法，但 SLSsteam 从某个版本起
 改用 `config.toml`，写 YAML 等于写进一个 SLSsteam 根本不读的文件。那些方法已删除，
@@ -45,20 +44,21 @@ def find_slssteam() -> dict[str, object]:
 
 
 class SLSConfig:
-    """SLSsteam 配置的【只读】视图（主要读 config.toml 里的 AppIds）。"""
+    """SLSsteam 所有权的【只读】视图（config.toml 列表 + Lua addappid）。"""
 
-    def __init__(self, path: Path | None = None):
+    def __init__(self, path: Path | None = None, lua_dir: Path | None = None):
         self.path = Path(path) if path else CONFIG_PATH
         self.data: dict = {}
         self.raw: str = ""
-        # ★ SLSsteam 从某个版本起改用 config.toml（YAML 被弃用）。
-        #   owned() 等只读接口需要能看到 TOML 里的 AppIds，
-        #   否则会误报"已声明拥有 0 个"。
         self.toml_path: Path | None = None
+        # 默认读 SLSsteam 的 lua 目录；显式传 path（测试）时只读传入的文件，除非也给了 lua_dir
+        self.lua_dir: Path | None = Path(lua_dir) if lua_dir else None
         if path is None:
             cand = CONFIG_PATH.with_suffix(".toml")
             if cand.is_file():
                 self.toml_path = cand
+            if self.lua_dir is None:
+                self.lua_dir = SLS_DIR / "lua"
         elif str(path).endswith(".toml"):
             # 允许直接传入 .toml 路径（测试/显式调用）
             self.toml_path = Path(path)
@@ -78,8 +78,15 @@ class SLSConfig:
 
     # ---------------------------------------------------------------- 查询
     def owned(self) -> set[int]:
-        """已声明拥有的 appid —— 读 config.toml 的 AppIds + AdditionalApps。"""
+        """已声明拥有的 appid —— Lua 的 addappid + config.toml 的 AppIds / AdditionalApps。"""
         out: set[int] = set()
+        if self.lua_dir and self.lua_dir.is_dir():
+            for f in self.lua_dir.glob("*.lua"):
+                try:
+                    out.update(int(x) for x in re.findall(
+                        r"addappid\(\s*(\d+)", f.read_text(encoding="utf-8", errors="replace")))
+                except Exception:
+                    pass
         if self.toml_path and self.toml_path.is_file():
             try:
                 txt = self.toml_path.read_text(encoding="utf-8", errors="replace")

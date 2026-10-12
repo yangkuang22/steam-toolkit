@@ -5,8 +5,11 @@
   但旧版本的清单从不删除。实测堆积了 692 个文件 / 191 MB，
   其中 648 个 / 157 MB 是无引用的旧版本。
 
-安全设计（三重保护）:
-  ① 白名单: Lua 里 setManifestid 引用的 + ACF 里记录的，绝不删
+安全设计:
+  ⓪ 只管自己: 只清理我们 Lua 里 setManifestid 过的 depot 的旧版本。
+     正版游戏的 depot、创意工坊（清单以 <appid>_<gid> 存在同一目录）一概不碰——
+     旧版本曾把僵尸毁灭工程 111 个工坊模组的清单当垃圾删掉。
+  ① 白名单: Lua pin 的 + ACF 记录的 + 创意工坊记录的，绝不删
   ② 先归档: 打包成 tar.zst 后才删原文件，可一键恢复
   ③ 校验:   归档完整性验证通过才执行删除
 
@@ -21,7 +24,6 @@ import re
 import subprocess
 import tarfile
 import time
-from collections import defaultdict
 from pathlib import Path
 
 STEAM = Path.home() / ".local/share/Steam"
@@ -35,38 +37,49 @@ ARCHIVE_DIR = Path(__file__).resolve().parent.parent / "backup/depotcache-archiv
 KEEP_ARCHIVES = 2          # 只保留最近 N 个归档（防止无限堆积）
 
 
-def protected() -> set[str]:
-    """绝对不删的清单（Lua pin 的 + ACF 记录的）"""
-    keep: set[str] = set()
+def _lua_pins() -> list[tuple[str, str]]:
+    pins: list[tuple[str, str]] = []
     for d in LUA_DIRS:
         if not d.is_dir():
             continue
         for f in d.glob("*.lua"):
-            for dep, gid in re.findall(
-                    r'setManifestid\((\d+),\s*"(\d+)"\)', f.read_text(errors="replace")):
-                keep.add(f"{dep}_{gid}")
+            pins += re.findall(r'setManifestid\((\d+),\s*"(\d+)"', f.read_text(errors="replace"))
+    return pins
+
+
+def managed_depots() -> set[str]:
+    """我们自己管理的 depot（Lua 里 setManifestid 过的）。只有它们的旧版本才可能被清理。"""
+    return {dep for dep, _ in _lua_pins()}
+
+
+def protected() -> set[str]:
+    """绝对不删的清单（Lua pin 的 + ACF 记录的 + 创意工坊记录的）"""
+    keep: set[str] = {f"{dep}_{gid}" for dep, gid in _lua_pins()}
     for f in ACF_DIR.glob("appmanifest_*.acf"):
         t = f.read_text(errors="replace")
         for dep, gid in re.findall(r'"(\d{5,8})"\s*\{\s*"manifest"\s*"(\d+)"', t):
             keep.add(f"{dep}_{gid}")
+    for f in (ACF_DIR / "workshop").glob("appworkshop_*.acf"):
+        m = re.match(r"appworkshop_(\d+)\.acf$", f.name)
+        if not m:
+            continue
+        for gid in re.findall(r'"manifest"\s*"(\d+)"', f.read_text(errors="replace")):
+            keep.add(f"{m.group(1)}_{gid}")
     return keep
 
 
 def scan() -> tuple[list[Path], list[Path], dict]:
     """返回 (可删文件, 保留文件, 统计)"""
     keep_keys = protected()
+    ours = managed_depots()
     files = list(DEPOTCACHE.glob("*.manifest"))
     deletable, keeping = [], []
-    groups: dict[str, list] = defaultdict(list)
     for f in files:
         m = re.match(r"(\d+)_(\d+)\.manifest$", f.name)
-        if not m:
+        if not m or m.group(1) not in ours or f"{m.group(1)}_{m.group(2)}" in keep_keys:
             keeping.append(f)
-            continue
-        groups[m.group(1)].append((m.group(2), f))
-    for dep, versions in groups.items():
-        for gid, f in versions:
-            (keeping if f"{dep}_{gid}" in keep_keys else deletable).append(f)
+        else:
+            deletable.append(f)
     stats = {
         "total": len(files),
         "deletable": len(deletable),
@@ -179,7 +192,7 @@ def main() -> int:
     print(" depotcache 清理" + ("（只检查）" if "--check" in args or "--apply" not in args else "（执行）"))
     print("=" * 62)
     print(f"  总文件:   {st['total']:>5} 个  {st['total_bytes']/1048576:>7.1f} MB")
-    print(f"  保留:     {st['keeping']:>5} 个（Lua pin + ACF 引用）")
+    print(f"  保留:     {st['keeping']:>5} 个（非本工具管理的 depot / Lua pin / ACF / 创意工坊）")
     print(f"  可清理:   {st['deletable']:>5} 个  {st['deletable_bytes']/1048576:>7.1f} MB")
     print()
     if "--apply" not in args:
