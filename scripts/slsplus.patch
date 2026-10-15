@@ -34,10 +34,35 @@ index 8f59617..1df2b06 100644
  	cp "$(LIBMEM_DIR)/build-static32/liblibmem.a" "$(DEFAULT_LIBMEM_A)"
  
 diff --git a/res/patterns.toml b/res/patterns.toml
-index e9eb164..cb3dc23 100644
+index e9eb164..1eea627 100644
 --- a/res/patterns.toml
 +++ b/res/patterns.toml
-@@ -55,6 +55,7 @@ pattern = "89 45 ? 83 C4 10 83 EC 0C 89 F3"
+@@ -15,9 +15,9 @@ follow = "None"
+ pattern = "55 57 56 53 E8 ? ? ? ? 81 C3 ? ? ? ? 83 EC 24 8B 44 24 44 8B 6C 24 38 8B 7C 24 3C 8B 74 24 40 89 44 24 10 8B 44 24 48 89 44 24 14"
+ 
+ [Patterns.steamclient."BuildDepotDependency"]
+-follow = "None"
+-pattern = "55 89 E5 57 56 E8 ? ? ? ? 81 C6 ? ? ? ? 53 81 EC 2C 02 00 00 8B 45 08 89 85 1C FE FF FF 8B 45 10 89 85 24 FE FF FF"
+-
++follow = "Relative"
++# 2026-10-15: call-site signature from upstream AceSLS (survives stack-frame drift)
++pattern = "E8 ? ? ? ? 83 C4 ? 84 C0 74 ? 8B 45 ? 85 C0 89 45"
+ [Patterns.steamclient."BUpdateAppDownloadPlan"]
+ follow = "None"
+ optional = true
+@@ -25,8 +25,10 @@ pattern = "E8 ? ? ? ? 05 ? ? ? ? 55 89 E5 57 56 53 81 EC DC 00 00 00 89 85 50 FF
+ 
+ [Patterns.steamclient."CAPIJob::GetPlayerStats"]
+ follow = "Relative"
++# 2026-10-15: no longer found in Steam 1791918634 and upstream dropped this hook.
++# Only used by OfflineAchievementsSchema; hooks.cpp now treats a miss as non-fatal.
++optional = true
+ pattern = "E8 ? ? ? ? 83 C4 10 89 C5 E9 ? ? ? ? ? ? 80 BE ? ? ? ? 00"
+-
+ [Patterns.steamclient."CProtoBufMsgBase::InitFromPacket"]
+ follow = "Relative"
+ pattern = "E8 ? ? ? ? 58 8B 45 ? 8B 8D"
+@@ -55,6 +57,7 @@ pattern = "89 45 ? 83 C4 10 83 EC 0C 89 F3"
  
  [Patterns.steamclient."CSteamMatchmakingServers::RequestInternetServerList"]
  follow = "PrologueUpwards"
@@ -45,7 +70,22 @@ index e9eb164..cb3dc23 100644
  prologue = "E8 57 E5 89 55"
  pattern = "C7 04 24 ? 03 00 00 E8 ? ? ? ? 5A 89 45 ? 59 FF B6 08 01 00 00 FF B6 04 01 00 00 FF B6 00 01 00 00 FF B6 FC 00 00 00 FF B6 F8 00 00 00 6A 01 6A 00 FF 75 18 56 50 E8"
  
-@@ -115,6 +116,7 @@ pattern = "55 89 E5 57 56 E8 ? ? ? ? 81 C6 ? ? ? ? 53 81 EC 70 01 00 00 8B 45 08
+@@ -63,10 +66,10 @@ follow = "Relative"
+ pattern = "E8 ? ? ? ? 88 45 ? 83 C4 10 84 C0 0F 84 ? ? ? ? 8B 45 ? 80 7D ? 00"
+ 
+ [Patterns.steamclient."CUser::GetSubscribedApps"]
+-follow = "Relative"
+-pattern = "E8 ? ? ? ? 89 C6 83 C4 10 85 C0 0F 84 ? ? ? ? 8B 9D ? ? ? ? 39 D8"
+-
+-# Resolves to CSteamEngine::PostCallback
++follow = "PrologueUpwards"
++# 2026-10-15: from upstream AceSLS 7a5c378
++prologue = "56 57 E5 89 55"
++pattern = "89 75 ? 0F 29 45"
+ [Patterns.steamclient."CUser::PostCallback"]
+ follow = "Relative"
+ pattern = "E8 ? ? ? ? 8D 86 ? ? ? ? 83 C4 18 68 F6 01 00 00"
+@@ -115,6 +118,7 @@ pattern = "55 89 E5 57 56 E8 ? ? ? ? 81 C6 ? ? ? ? 53 81 EC 70 01 00 00 8B 45 08
  
  [Patterns.steamclient."IClientRemoteStorage::RunIPCFrame"]
  follow = "PrologueUpwards"
@@ -53,20 +93,136 @@ index e9eb164..cb3dc23 100644
  prologue = "E5 89 55"
  pattern = "6A 04 50 51 E8 ? ? ? ? 8B 85 ? FE FF FF 83 C4 10 3D ? ? ? ?"
  
-@@ -158,6 +160,7 @@ pattern = "55 89 E5 57 56 E8 ? ? ? ? 81 C6 ? ? ? ? 53 81 EC ? 54 00 00 8B 45 08
+@@ -158,8 +162,9 @@ pattern = "55 89 E5 57 56 E8 ? ? ? ? 81 C6 ? ? ? ? 53 81 EC ? 54 00 00 8B 45 08
  
  [Patterns.steamclient."IClientUserStats::RunIPCFrame"]
  follow = "None"
 +optional = true
  # Entry prologue + sub esp,0x2C0 + stable local spill slots.
- pattern = "55 89 E5 57 56 E8 ? ? ? ? 81 C6 ? ? ? ? 53 81 EC C0 02 00 00 8B 45 08 8B 4D 0C 8B 7D 14 89 85 40 FF FF FF 8B 45 10 89 8D 4C FF FF FF 89 F3 89 85 54 FF FF FF 65 A1 14 00 00 00 89 45 E4 31 C0 8D 85 5C FF FF FF 6A 04 50 51 E8 ? ? ? ? 8B 85 5C FF FF FF 83 C4 10 3D ? 65 6D 87"
+-pattern = "55 89 E5 57 56 E8 ? ? ? ? 81 C6 ? ? ? ? 53 81 EC C0 02 00 00 8B 45 08 8B 4D 0C 8B 7D 14 89 85 40 FF FF FF 8B 45 10 89 8D 4C FF FF FF 89 F3 89 85 54 FF FF FF 65 A1 14 00 00 00 89 45 E4 31 C0 8D 85 5C FF FF FF 6A 04 50 51 E8 ? ? ? ? 8B 85 5C FF FF FF 83 C4 10 3D ? 65 6D 87"
++pattern = "55 89 E5 57 56 E8 ? ? ? ? 81 C6 ? ? ? ? 53 81 EC C0 02 00 00 8B 45 08 8B 4D 0C 8B 7D 14 89 85 40 FF FF FF 8B 45 10 89 8D 4C FF FF FF 89 F3 89 85 54 FF FF FF 65 A1 14 00 00 00 89 45 E4 31 C0 8D 85 5C FF FF FF 6A 04 50 51 E8 ? ? ? ? 8B 85 5C FF FF FF 83 C4 10 3D ? ? ? ?"
  
-@@ -220,4 +223,5 @@ pattern = "55 89 E5 57 56 53 E8 ? ? ? ? 81 C3 ? ? ? ? 81 EC 8C 00 00 00 8B 7D 08
+ [Patterns.steamclient."IClientUtils::RunIPCFrame"]
+ follow = "None"
+@@ -179,8 +184,8 @@ pattern = "E8 ? ? ? ? 05 ? ? ? ? 55 89 E5 57 56 53 83 EC 3C 8B 55 14 8B 75 0C 89
+ [Patterns.steamclient."CConfigStore::SharedConfigWriteCallsite"]
+ follow = "None"
+ optional = true
+-pattern = "8B 85 50 EF FF FF 83 C4 28 8B 80 ? 3B 00 00 FF B5 9C EF FF FF FF B5 8C EF FF FF 53 6A 00 6A 07 FF B5 D4 EE FF FF FF 10"
+-
++# 2026-10-15: frame/global offsets wildcarded
++pattern = "8B 85 ? ? FF FF 83 C4 28 8B 80 ? ? 00 00 FF B5 ? ? FF FF FF B5 ? ? FF FF 53 6A 00 6A 07 FF B5 ? ? FF FF FF 10"
+ [Patterns.steamclient."CConfigStore::WriteVdfFile"]
+ follow = "PrologueUpwards"
+ prologue = "53 56 57 55"
+@@ -198,9 +203,10 @@ follow = "Relative"
+ pattern = "E8 ? ? ? ? 8B 85 04 FF FF FF 83 C4 10 8B 40 54 89 85 FC FE FF FF"
+ 
+ [Patterns.steamclient."CWebSocketConnection::BBuildAndAsyncSendFrame"]
+-follow = "None"
+-pattern = "55 89 E5 57 E8 ? ? ? ? 81 C7 ? ? ? ? 56 53 81 EC AC 00 00 00 8B 45 10"
+-
++follow = "PrologueUpwards"
++# 2026-10-15: from upstream AceSLS (old entry signature became ambiguous: 2 hits)
++prologue = "E8 57 E5 89 55"
++pattern = "89 C6 85 D2 78"
+ [Patterns.steamclient."CCMConnection::RecvPkt"]
+ follow = "None"
+ pattern = "55 89 E5 57 E8 ? ? ? ? 81 C7 ? ? ? ? 56 53 83 EC 34 6A 01 FF 75 0C 89 FB E8 ? ? ? ?"
+@@ -212,7 +218,7 @@ pattern = "8B 85 ? ? ? ? 8B 40 ? 85 C0 0F 84 ? ? ? ? 39 46"
+ 
+ [Patterns.steamui."CSteamUIAppController::GetAppByID"]
+ follow = "None"
+-pattern = "E8 ? ? ? ? 05 ? ? ? ? 55 89 E5 57 56 53 83 EC 4C 8B 5D 10 8B 75 08 89 45 C8 8B 80 E0 09 00 00"
++pattern = "E8 ? ? ? ? 05 ? ? ? ? 55 89 E5 57 56 53 83 EC 4C 8B 5D 10 8B 75 08 89 45 C8 8B 80 ? ? 00 00"
+ 
+ [Patterns.steamui."CSteamUIAppController::FillInAppOverview"]
+ follow = "None"
+@@ -220,4 +226,5 @@ pattern = "55 89 E5 57 56 53 E8 ? ? ? ? 81 C3 ? ? ? ? 81 EC 8C 00 00 00 8B 7D 08
  
  [Patterns.steamui."CUpdateManager::MarkAppChange"]
  follow = "None"
+-pattern = "E8 ? ? ? ? 05 ? ? ? ? 55 89 E5 57 56 53 83 EC 3C ? ? ? ? ? ? 89 45 D4 8B 80 E0 09 00 00 85 ? 0F 94 C1 85 ? 8B 00 0F 94 C2 09 D1 89 CF 85 C0 0F 85 ? ? 00 00 C7 45 DC 00 00 00 00 84 C9 74 0B 8D 65 F4 5B 5E 5F 5D C3 8D 76 00 8B 45 08 83 40 40 01 83 50 44 00 83 FE 07"
 +optional = true
- pattern = "E8 ? ? ? ? 05 ? ? ? ? 55 89 E5 57 56 53 83 EC 3C ? ? ? ? ? ? 89 45 D4 8B 80 E0 09 00 00 85 ? 0F 94 C1 85 ? 8B 00 0F 94 C2 09 D1 89 CF 85 C0 0F 85 ? ? 00 00 C7 45 DC 00 00 00 00 84 C9 74 0B 8D 65 F4 5B 5E 5F 5D C3 8D 76 00 8B 45 08 83 40 40 01 83 50 44 00 83 FE 07"
++pattern = "E8 ? ? ? ? 05 ? ? ? ? 55 89 E5 57 56 53 83 EC 3C ? ? ? ? ? ? 89 45 D4 8B 80 ? ? 00 00 85 ? 0F 94 C1 85 ? 8B 00 0F 94 C2 09 D1 89 CF 85 C0 0F 85 ? ? 00 00 C7 45 DC 00 00 00 00 84 C9 74 0B 8D 65 F4 5B 5E 5F 5D C3 8D 76 00 8B 45 08 83 40 40 01 83 50 44 00 83 FE 07"
+diff --git a/src/config_default.hpp b/src/config_default.hpp
+index f85722c..a51570d 100644
+--- a/src/config_default.hpp
++++ b/src/config_default.hpp
+@@ -75,17 +75,6 @@ LogLevel = 2
+ # Use 0 as a key to set for all unowned Apps.
+ # Example: { 440 = 730 }
+ #[FakeAppIds]
+-#
+-# [[FakeAppIds.Flags]] entries gate a real -> fake mapping behind a Steam
+-# launch option, evaluated at LaunchApp time. Useful for setups where the
+-# mapping should only apply when a specific launch mode (e.g. -onlinefix) is
+-# selected. Apps/ExcludeApps are optional scopes; omit both to match any app.
+-# Example:
+-#   [[FakeAppIds.Flags]]
+-#   Flag = "-onlinefix"
+-#   FakeAppId = 480
+-#   Apps = [12345]
+-#   #ExcludeApps = [99999]
+ 
+ # Extra Data for DLCs belonging to a specific AppId. Only needed
+ # when the App you're playing is hit by Steam's 64 DLC limit.
+@@ -105,36 +94,6 @@ LogLevel = 2
+ #   76561198000000000 = [12345, 67890]
+ #[DenuvoGames]
+ 
+-# Inject a pre-compiled library into game processes.
+-#   *.dll → Proton (Wine) games: a 64-bit helper LD_PRELOAD'd inside each
+-#           Wine PE process detours ntdll!LdrLoadDll and loads the DLL the
+-#           first time the host loads steam_api64.dll / steamclient.dll
+-#           (i.e. the game process that just called SteamAPI_Init).
+-#   *.so  → Native Linux games: appended to LD_PRELOAD when SLSsteam
+-#           launches the game. Loaded into the game process by glibc.
+-# Path: absolute Linux path to a .dll or .so.
+-# Apps: list of AppIds to inject into (optional if Flag is set).
+-# Flag: a Steam launch option (e.g. "-onlinefix") that triggers injection.
+-#   Any game launched with this flag will inject the library; the flag is
+-#   stripped from argv before the game sees it. Apps and Flag can coexist.
+-# Same AppId may appear in both a .dll and a .so entry; per-launch the
+-# matching one fires based on the selected compat tool (Proton vs native).
+-# .dll entries require sls_proton_inject.so. Searched next to SLSsteam.so,
+-# then under /usr/lib and /usr/lib64; set Dir to override the search path.
+-# Examples:
+-#   [LibraryInject]
+-#   #Dir = "/custom/path"
+-#
+-#   # Flag: inject into any game launched with -onlinefix in its launch options
+-#   [[LibraryInject.Libs]]
+-#   Path = "/home/deck/.config/SLSsteam/OnlineFix.dll"
+-#   Flag = "-onlinefix"
+-#
+-#   # Apps: inject into specific AppIds only
+-#   [[LibraryInject.Libs]]
+-#   Path = "/path/to/other.dll"
+-#   Apps = [12345, 67890]
+-
+ # --- Internal (default values are optimal for most users) ---
+ 
+ # Fetch the latest patterns online (HTTPS) on startup to pick up updated
+@@ -150,11 +109,6 @@ LogLevel = 2
+ # data comes exclusively from local bin files in appcache/stats/.
+ #OfflineAchievementsSchema = false
+ 
+-# Drop outbound ownership-ticket network requests and suppress remote
+-# BUpdateAppOwnershipTicket for spoofed apps. Cached tickets are always
+-# injected regardless of this setting.
+-#BlockTicketRequests = true
+-
+ # Manifest settings for download functionality.
+ # Built-in request-code providers: opensteamtool / wudrm / steamrun.
+ # Providers is the ordered fallback chain.
+@@ -167,5 +121,4 @@ LogLevel = 2
+ 
+ # Additional Lua plugin directories scanned after the built-in Steam and user config dirs.
+ #[Lua]
+-#Paths = []
+-)";
++#Paths = [])";
 diff --git a/src/feats/requestcode.cpp b/src/feats/requestcode.cpp
 index e4445c5..2cac874 100644
 --- a/src/feats/requestcode.cpp
@@ -125,3 +281,116 @@ index e4445c5..2cac874 100644
  		uint64_t code = 0;
  		try { code = ready.future.get(); }
  		catch (const std::exception& e)
+diff --git a/src/hooks.cpp b/src/hooks.cpp
+index 3cfd7d9..cf249bc 100644
+--- a/src/hooks.cpp
++++ b/src/hooks.cpp
+@@ -295,6 +295,10 @@ static int hkLoadDepotDecryptionKey(void* pObject, uint32_t foo, char* KeyName,
+ 	// number of bytes written.
+ 	if (KeyName)
+ 	{
++		// ★ 诊断：记录 Steam 请求的每个 depot 密钥
++		if (g_pLog && strstr(KeyName, "DecryptionKey"))
++			g_pLog->debug("hkLoadDepotKey REQ: '%s'\n", KeyName);
++
+ 		const char* tag = strstr(KeyName, "\\DecryptionKey");
+ 		if (tag && tag > KeyName)
+ 		{
+@@ -312,6 +316,7 @@ static int hkLoadDepotDecryptionKey(void* pObject, uint32_t foo, char* KeyName,
+ 				const int written = DepotKey::provideKey(depotId, Key, KeySize);
+ 				if (written > 0)
+ 				{
++					g_pLog->debug("hkLoadDepotKey OK: depot=%u provided %d bytes\n", depotId, written);
+ 					return written;
+ 				}
+ 			}
+@@ -1188,6 +1193,9 @@ static bool hkClientRemoteStorage_IsCloudEnabledForApp(void* pClientRemoteStorag
+ static bool g_bUpdateAppDownloadPlanReady = false;
+ static bool g_bConfigStoreWriteVdfFileReady = false;
+ static bool g_bClientCompatReady = false;
++// CAPIJob::GetPlayerStats only matters for OfflineAchievementsSchema; its pattern
++// vanished in Steam 1791918634 (2026-10), so a miss must not abort startup.
++static bool g_bGetPlayerStatsReady = false;
+ 
+ static void hkClientRemoteStorage_RunIPCFrame(void* pClientRemoteStorage, void* a1, void* a2, void* a3)
+ {
+@@ -1731,7 +1739,6 @@ bool Hooks::setup()
+ 		LoadDepotDecryptionKey.setup(Patterns::LoadDepotDecryptionKey, &hkLoadDepotDecryptionKey)
+ 		&& BuildDepotDependency.setup(Patterns::BuildDepotDependency, &hkBuildDepotDependency)
+ 
+-		&& CAPIJob_GetPlayerStats.setup(Patterns::CAPIJob::GetPlayerStats, &hkCAPIJob_GetPlayerStats)
+ 
+ 		&& CProtoBufMsgBase_InitFromPacket.setup(Patterns::CProtoBufMsgBase::InitFromPacket, &hkProtoBufMsgBase_InitFromPacket)
+ 		&& CProtoBufMsgBase_Send.setup(Patterns::CProtoBufMsgBase::Send, &hkProtoBufMsgBase_Send)
+@@ -1773,6 +1780,10 @@ bool Hooks::setup()
+ 
+ 		&& ISteamMatchmakingPingResponse_ServerResponded.setup(Patterns::ISteamMatchmakingPingResponse::ServerResponded, hkSteamMatchmakingPingResponse_ServerResponded);
+ 
++	g_bGetPlayerStatsReady = CAPIJob_GetPlayerStats.setup(Patterns::CAPIJob::GetPlayerStats, &hkCAPIJob_GetPlayerStats);
++	if (!g_bGetPlayerStatsReady)
++		g_pLog->info("CAPIJob::GetPlayerStats pattern unresolved; OfflineAchievementsSchema eresult override disabled.\n");
++
+ 	g_bUpdateAppDownloadPlanReady = BUpdateAppDownloadPlan.setup(Patterns::BUpdateAppDownloadPlan, &hkBUpdateAppDownloadPlan);
+ 
+ 	g_pLog->debug
+@@ -1828,7 +1839,8 @@ void Hooks::place()
+ 		CConfigStore_WriteVdfFile.place();
+ 	}
+ 
+-	CAPIJob_GetPlayerStats.place();
++	if (g_bGetPlayerStatsReady)
++		CAPIJob_GetPlayerStats.place();
+ 
+ 	CProtoBufMsgBase_InitFromPacket.place();
+ 	CProtoBufMsgBase_Send.place();
+@@ -1888,7 +1900,8 @@ void Hooks::remove()
+ 		CConfigStore_WriteVdfFile.remove();
+ 	}
+ 
+-	CAPIJob_GetPlayerStats.remove();
++	if (g_bGetPlayerStatsReady)
++		CAPIJob_GetPlayerStats.remove();
+ 
+ 	CProtoBufMsgBase_InitFromPacket.remove();
+ 	CProtoBufMsgBase_Send.remove();
+diff --git a/src/sdk/CNetPacket.hpp b/src/sdk/CNetPacket.hpp
+index e8995a4..8aaff68 100644
+--- a/src/sdk/CNetPacket.hpp
++++ b/src/sdk/CNetPacket.hpp
+@@ -15,8 +15,9 @@ static constexpr uint32_t kMsgHdrProtoFlag = 0x80000000u;
+ // m_cubData@+0x08) matches the CCMConnection::RecvPkt -> classifier disassembly
+ // (reads [pkt+4]/[pkt+8]). Only the fields the request-code hook touches are modeled.
+ struct CNetPacket {
+-    uint32_t m_hConnection;   // +0x00
+-    uint8_t* m_pubData;       // +0x04  — MsgHdr + protobuf header + protobuf body
+-    uint32_t m_cubData;       // +0x08
++    // Steam 1791918634 (2026-10-14) grew the head from 4 to 12 bytes (matches AceSLS 28d507f).
++    uint8_t  __pad0x0[0xC];   // +0x00 (was m_hConnection@0 before 2026-10-14)
++    uint8_t* m_pubData;       // +0x0C  — MsgHdr + protobuf header + protobuf body
++    uint32_t m_cubData;       // +0x10
+     // remaining fields (m_cRef, m_pubNetworkBuffer, m_pNext) intentionally omitted
+ };
+diff --git a/src/sdk/CProtoBufMsgBase.hpp b/src/sdk/CProtoBufMsgBase.hpp
+index 121111c..285b34e 100644
+--- a/src/sdk/CProtoBufMsgBase.hpp
++++ b/src/sdk/CProtoBufMsgBase.hpp
+@@ -32,12 +32,13 @@ enum EGameFlags
+ class CProtoBufMsgBase
+ {
+ public:
+-	char __pad_0x0[0x14];		//0x0
+-	uint16_t type;				//0x14
+-	char __pad_0x16[0x6];		//0x16
+-	CMsgProtoBufHeader* header; //0x1C
+-	void* __pBody;				//0x20
+-	char __pad_0x24[0x8];		//0x24
++	// Steam 1791918634 (2026-10-14): everything shifted +8 (matches AceSLS d3e3fdd)
++	char __pad_0x0[0x1C];		//0x0
++	uint16_t type;				//0x1C
++	char __pad_0x1E[0x6];		//0x1E
++	CMsgProtoBufHeader* header; //0x24
++	void* __pBody;				//0x28
++	char __pad_0x2C[0x8];		//0x2C
+ 	
+ 	uint32_t send();
+ 	template<typename T> constexpr T* getBody() const

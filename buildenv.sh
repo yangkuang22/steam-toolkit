@@ -33,3 +33,12 @@ export PKG_CONFIG_PATH="$SLSU_TOOLS/usr/lib/pkgconfig"
 
 # 等价的 32 位专属变量（有些 Makefile 只看这些）
 export LIBRARY_PATH="$SLSU_TOOLS/usr/lib:${LIBRARY_PATH:-}"
+
+# ★ libm 必须链接系统自带的那份（2026-10-15 踩坑）：buildtools 里的 lib32-glibc 比 SteamOS 新，
+#   链接时 fmod 会绑定到 GLIBC_2.43，SteamOS(glibc 2.41) 加载不了 → 启动器判定"依赖缺失"回退不注入。
+#   gcc -m32 会先找 <LIBRARY_PATH 目录>/../lib32，所以符号链接放在 syslibm/lib32，路径写 syslibm/lib。
+if [ -e /usr/lib32/libm.so.6 ]; then
+    mkdir -p "$SLSU_TOOLS/syslibm/lib" "$SLSU_TOOLS/syslibm/lib32"
+    ln -sf /usr/lib32/libm.so.6 "$SLSU_TOOLS/syslibm/lib32/libm.so"
+    export LIBRARY_PATH="$SLSU_TOOLS/syslibm/lib:$LIBRARY_PATH"
+fi
