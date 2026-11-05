@@ -12,7 +12,6 @@
 """
 from __future__ import annotations
 
-import json
 import os
 import time
 import urllib.request
@@ -144,24 +143,3 @@ def fetch_resumable(url: str, dest: Path, *, timeout: int = 20,
     if verbose:
         print(f"    ✗ 未完成（{got:,}/{total:,} 字节）")
     return False
-
-
-def fetch_json(url: str, dest: Path, *, verbose: bool = False,
-               timeout: int = 30) -> dict | None:
-    """下载并解析 JSON，带断点续传。成功返回 dict。"""
-    if not fetch_resumable(url, dest, timeout=timeout, verbose=verbose):
-        # 尝试用已有的（哪怕不完整）
-        part = dest.with_suffix(dest.suffix + ".part")
-        for f in (dest, part):
-            if f.is_file():
-                try:
-                    return json.loads(f.read_text())
-                except Exception:
-                    continue
-        return None
-    try:
-        return json.loads(dest.read_text())
-    except Exception as exc:  # noqa: BLE001
-        if verbose:
-            print(f"    JSON 解析失败: {exc}")
-        return None

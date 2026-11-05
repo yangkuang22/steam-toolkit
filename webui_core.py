@@ -152,6 +152,8 @@ def fetch_dlcs(appid: int) -> list[int]:
     为什么不需要 DLC 的密钥:
       服装/道具类 DLC 内容都在【本体 depot】里，它们只是"解锁标记"。
       实测（怪物猎人崛起抽查 8 个 DLC）：全部无独立 depot。
+    ★ 但不是所有游戏都这样：命运石之门 RE:BOOT(4012810) 的 3 个 DLC 都有独立 depot，
+      这里只解锁所有权，DLC 内容的密钥和清单不在这个函数的处理范围内。
 
     ★ 必须过滤掉"其实是 depot 的条目" —— SteamUnlock 的 config.dlcs
       里偶尔混进本体 depot。实测:
