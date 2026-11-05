@@ -4,12 +4,16 @@
 #   1. 自动检查注入库是否存在且可加载
 #   2. 任何异常都回退到"不带注入"启动，保证 Steam 一定能开
 #   3. 设置 SLS_NOINJECT=1 可强制不注入
-#   4. 崩溃保护：连续 3 次启动异常自动降级为不注入
+#   4. 崩溃保护：连续 3 次启动崩溃自动降级为不注入，
+#      注入库或 Steam 更新后自动恢复注入
 # ============================================================
 SLSDIR="$HOME/.local/share/SLSsteam"
 LIB1="$SLSDIR/library-inject.so"
 LIB2="$SLSDIR/SLSsteam.so"
 STEAMBIN="/usr/bin/steam"
+STEAMCLIENT="$HOME/.local/share/Steam/ubuntu12_32/steamclient.so"
+CONSOLE_LOG="$HOME/.local/share/Steam/logs/console-linux.txt"
+MONITOR_SECS=30
 
 # 日志放项目目录（不污染根目录）。项目目录由 install.sh 部署时写入 __SUOS_DIR__；
 # 没写入/不存在就试两个候选（新安装 ~/steam-toolkit、老安装 ~/SteamUnlockOS）；
@@ -84,13 +88,24 @@ if command -v ldd >/dev/null 2>&1; then
     fi
 fi
 
-# ★ 崩溃保护：连续失败 3 次就自动降级为不注入（避免一直崩）
+# ★ 崩溃保护：连续崩溃 3 次就自动降级为不注入（避免一直崩）
 FAILFILE="$HOME/.SLSsteam-crash-count"
+if [ -f "$FAILFILE" ]; then
+    # 注入库或 Steam 更新过，之前的崩溃记录就作废，重新试注入
+    if [ "$LIB2" -nt "$FAILFILE" ] || [ "$STEAMCLIENT" -nt "$FAILFILE" ]; then
+        log "注入库或 Steam 已更新 → 清除崩溃记录，重新尝试注入"
+        rm -f "$FAILFILE" 2>/dev/null
+    fi
+fi
 if [ -f "$FAILFILE" ]; then
     fails=$(cat "$FAILFILE" 2>/dev/null || echo 0)
     if [ "${fails:-0}" -ge 3 ]; then
-        log "检测到连续 $fails 次启动异常 → 自动降级为【不注入】启动"
-        log "  修好后删除 $FAILFILE 即可恢复注入"
+        log "检测到连续 $fails 次启动崩溃 → 自动降级为【不注入】启动"
+        log "  修好后删除 $FAILFILE 即可恢复注入（注入库或 Steam 更新后会自动恢复）"
+        if command -v notify-send >/dev/null 2>&1; then
+            notify-send -t 0 "Steam Toolkit" \
+                "Steam 连续崩溃 $fails 次，已临时关闭注入，入库游戏可能显示“购买”。" 2>/dev/null &
+        fi
         exec "$STEAMBIN" "$@"
     fi
 fi
@@ -98,25 +113,54 @@ fi
 log "带 SLSsteam-Plus 注入启动"
 export LD_AUDIT="$LIB1:$LIB2"
 
-# 启动并监控：30 秒内【异常】退出 = 视为失败
-"$STEAMBIN" "$@" &
+# 同一次启动可能同时来两个调用（日志里同一秒两条）。只让拿到锁的那个监控和计数，
+# 否则一次崩溃会被算两次；另一个照常带注入启动，由 Steam 自己决定谁转发。
+if command -v flock >/dev/null 2>&1; then
+    exec 9>"$HOME/.SLSsteam-launcher.lock"
+    if ! flock -n 9; then
+        exec 9>&-
+        exec "$STEAMBIN" "$@"
+    fi
+fi
+
+# steam.sh 会吞掉段错误（自己退出码还是 0），退出码判断不了崩溃，所以看控制台日志里
+# 这次启动之后有没有新增崩溃记录，形如:
+#   steam.sh: line 995: 65827 Segmentation fault (core dumped) "$STEAMROOT/$STEAMEXEPATH" "$@"
+console_offset=$(stat -c %s "$CONSOLE_LOG" 2>/dev/null || echo 0)
+crashed_since_start() {
+    local size
+    size=$(stat -c %s "$CONSOLE_LOG" 2>/dev/null) || return 1
+    # 日志轮换过（变小了）就从头看
+    [ "$size" -lt "$console_offset" ] && console_offset=0
+    tail -c +"$((console_offset + 1))" "$CONSOLE_LOG" 2>/dev/null |
+        grep -qE 'steam\.sh: line [0-9]+: +[0-9]+ +(Segmentation fault|Aborted|Bus error|Illegal instruction)'
+}
+
+# 启动并监控：MONITOR_SECS 秒内退出就检查是不是崩溃。每秒看一次，崩了不用白等满。
+"$STEAMBIN" "$@" 9>&- &
 SPID=$!
-sleep 30
+waited=0
+while [ "$waited" -lt "$MONITOR_SECS" ] && kill -0 "$SPID" 2>/dev/null; do
+    sleep 1
+    waited=$((waited + 1))
+done
+
 if kill -0 "$SPID" 2>/dev/null; then
     # 还活着 → 清空失败计数
     rm -f "$FAILFILE" 2>/dev/null
     wait "$SPID"
     exit $?
-else
-    wait "$SPID" 2>/dev/null
-    rc=$?
-    if [ "$rc" -eq 0 ]; then
-        # 正常退出（例如用户很快关了 Steam）不是崩溃
-        log "Steam 在 30 秒内正常退出（退出码 0），不计为崩溃"
-        exit 0
-    fi
-    fails=$(cat "$FAILFILE" 2>/dev/null || echo 0)
-    echo $((fails + 1)) > "$FAILFILE"
-    log "Steam 在 30 秒内退出（第 $((fails+1)) 次），退出码 $rc"
-    exit $rc
 fi
+
+wait "$SPID" 2>/dev/null
+rc=$?
+sleep 1    # 等日志进程把最后几行写完
+if [ "$rc" -eq 0 ] && ! crashed_since_start; then
+    # 正常退出（例如用户很快关了 Steam，或只是转发了参数）不是崩溃
+    log "Steam 在 $waited 秒内正常退出，不计为崩溃"
+    exit 0
+fi
+fails=$(cat "$FAILFILE" 2>/dev/null || echo 0)
+echo $((fails + 1)) > "$FAILFILE"
+log "Steam 启动后 $waited 秒内崩溃（第 $((fails + 1)) 次），退出码 $rc"
+exit "$rc"

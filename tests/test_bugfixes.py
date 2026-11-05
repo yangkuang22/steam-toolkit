@@ -707,7 +707,7 @@ class TestLauncherCrashGuard(unittest.TestCase):
         fake.chmod(0o755)
         text = (ROOT / "scripts/launcher.sh").read_text(encoding="utf-8")
         text = text.replace('STEAMBIN="/usr/bin/steam"', f'STEAMBIN="{fake.as_posix()}"')
-        text = text.replace("sleep 30", "sleep 1")
+        text = text.replace("MONITOR_SECS=30", "MONITOR_SECS=2")
         # 不让本机真实运行的 Steam 干扰测试：只把测试指定的路径当成"运行中的 Steam"
         text = text.replace("*/ubuntu12_32/steam)", (running_pattern or "/nonexistent/x") + ")")
         launcher = tmp / "launcher.sh"
