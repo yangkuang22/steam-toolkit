@@ -353,6 +353,26 @@ index 3cfd7d9..cf249bc 100644
  
  	CProtoBufMsgBase_InitFromPacket.remove();
  	CProtoBufMsgBase_Send.remove();
+diff --git a/src/memhlp.cpp b/src/memhlp.cpp
+index 416651b..57ee87f 100644
+--- a/src/memhlp.cpp
++++ b/src/memhlp.cpp
+@@ -35,9 +35,13 @@ std::vector<lm_address_t> MemHlp::patternScanAll(const char* pattern, lm_module_
+ 	std::vector<lm_address_t> matches;
+ 	for (const auto& itm : cachedSegments)
+ 	{
+-		if (targetModule.base > itm.second)
++		// Segment ends are exclusive: a mapping that merely touches the module
++		// (e.g. a thread stack placed directly below it) must not be scanned.
++		// Since glibc 2.42 the stack guard can live inside the same VMA, so
++		// reading such a neighbour faults on its first byte.
++		if (itm.second <= targetModule.base)
+ 			continue;
+-		if (targetModule.base + targetModule.size < itm.first)
++		if (itm.first >= targetModule.base + targetModule.size)
+ 			continue;
+ 		const auto* buf = reinterpret_cast<const uint8_t*>(itm.first);
+ 		const size_t len = itm.second - itm.first;
 diff --git a/src/sdk/CNetPacket.hpp b/src/sdk/CNetPacket.hpp
 index e8995a4..8aaff68 100644
 --- a/src/sdk/CNetPacket.hpp
