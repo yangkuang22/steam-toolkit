@@ -1,11 +1,10 @@
 # ============================================================
-# 票据提取器（在 Windows 上运行）
+# AppOwnershipTicket 导出工具（在 Windows 上运行）
 #
-# 作用: 从 Steam 的注册表里提取【你真拥有】游戏的 AppOwnershipTicket
-#       这些"源票据"可以用来伪造其他游戏的票据
+# 作用: 从 Steam 注册表导出 AppOwnershipTicket 用于格式分析和跨平台同步
 #
 # 原理: Steam 把票据存在 HKCU\Software\Valve\Steam\Apps\<appid>\AppTicket
-#       如果 SLSsteam-Plus 有了源票据，就能用 off-by-four 漏洞伪造出其他游戏的
+#       导出的票据用于 SLSsteam 的认证配置
 #
 # 用法: 管理员 PowerShell，直接粘贴运行
 # ============================================================
@@ -98,7 +97,7 @@ Write-Host "已保存:" -Fore Green
 Write-Host "  $p"
 Write-Host "  $(Join-Path ([Environment]::GetFolderPath('Desktop')) 'steam票据.json')"
 Write-Host ""
-Write-Host "把你拥有的游戏票据发我（尤其是 appid 7 / 220 / 440 等基础 app）"
-Write-Host "它将用于伪造其他游戏的票据" -Fore Cyan
+Write-Host "导出的票据用于 SLSsteam 认证配置（尤其是 appid 7 / 220 / 440 等基础 app）"
+Write-Host "票据将用于跨平台认证同步" -Fore Cyan
 Write-Host "=========================================="
 Read-Host "回车退出"

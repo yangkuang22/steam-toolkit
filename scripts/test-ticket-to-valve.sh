@@ -1,8 +1,8 @@
 #!/bin/bash
 # ============================================================
-# 测试：让构造的票据发给 Valve（而不是被拦截）
+# 票据请求控制（切换 BlockTicketRequests 配置）
 #
-# 假设：Valve 用 off-by-four 漏洞解析票据 → 认为你有许可 → 发真密钥
+# 控制 SLSsteam 是否拦截发往 Valve 的认证票据请求
 #
 # 使用: bash scripts/test-ticket-to-valve.sh on|off|status
 # ============================================================
