@@ -22,9 +22,6 @@ backup/
 *.orig
 *.bak
 
-# Windows 工具产物
-tools/*.dump
-
 # 日志历史（本地归档，不入库）
 logs/history/
 
