@@ -25,12 +25,14 @@ from pathlib import Path
 
 URL = "https://api.993499094.xyz/depotkeys.json"
 TIMEOUT = 120
-CACHE_TTL = 7 * 24 * 3600  # 7 天（网络不稳，延长缓存）
+CACHE_TTL = 6 * 3600       # 6 小时。新游戏天天出，7 天太长；
+                           # 远端没变时只花一次 ETag 探测，不会重下 18 MB
 MIN_ENTRIES = 1000         # 少于这个数不可能是完整的密钥库
 
 _CACHE_DIR = Path(os.environ.get("SUOS_CACHE", str(Path.home() / ".cache/suos")))
 _CACHE = _CACHE_DIR / "sudama_depotkeys.json"
 _RAW = _CACHE_DIR / "sudama_depotkeys.raw.json"   # 下载落地文件，绝不和缓存共用路径
+_FP = _CACHE_DIR / "sudama_depotkeys.fp.json"     # 远端 ETag/Last-Modified，用于"变了没"判断
 _mem: dict | None = None
 _refresh_lock = threading.Lock()
 
@@ -86,15 +88,78 @@ def _load_cache(allow_stale: bool = False) -> dict | None:
     return data
 
 
+def age() -> float:
+    """本地缓存写入至今多少秒；没有可用缓存就返回 inf。"""
+    if not _CACHE.is_file():
+        return float("inf")
+    try:
+        raw = json.loads(_CACHE.read_text())
+    except Exception:  # noqa: BLE001
+        return float("inf")
+    data, ts, _ = _unwrap(raw)
+    if not _is_key_table(data) or ts <= 0:
+        return float("inf")
+    return max(0.0, time.time() - ts)
+
+
+def _save_fp(fp: tuple[str, str, int]) -> None:
+    try:
+        _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        _FP.write_text(json.dumps(
+            {"etag": fp[0], "last_modified": fp[1], "size": fp[2]}))
+    except OSError:
+        pass
+
+
+def _load_fp() -> tuple[str, str, int]:
+    try:
+        d = json.loads(_FP.read_text())
+        return (str(d.get("etag") or ""), str(d.get("last_modified") or ""),
+                int(d.get("size") or 0))
+    except Exception:  # noqa: BLE001
+        return ("", "", 0)
+
+
+def _unchanged_remotely(verbose: bool = False) -> bool:
+    """远端还是上次那份吗？只花一次 Range GET（1 字节），不下全文。
+
+    密钥库 18 MB，TTL 到期就无条件重下太浪费；ETag/Last-Modified 一致
+    说明内容没变，直接把本地缓存的时间戳刷新即可。
+    """
+    old = _load_fp()
+    if not any(old[:2]):
+        return False
+    try:
+        from . import fetch as _fetch
+        new = _fetch.remote_fingerprint(URL)
+    except Exception:  # noqa: BLE001
+        return False
+    if not any(new[:2]):
+        return False
+    same = (new[0] and new[0] == old[0]) or (new[1] and new[1] == old[1])
+    if same and verbose:
+        print("  Sudama: 远端未变化（ETag 一致），只刷新缓存时间戳")
+    return bool(same)
+
+
 def _download(verbose: bool = False) -> dict | None:
     """下载并校验。只有拿到完整的密钥表才写缓存，失败返回 None。"""
     try:
         from . import fetch as _fetch
-        if _fetch.fetch_resumable(URL, _RAW, verbose=verbose, timeout=25):
+        # min_bytes: 端点是 chunked（无 Content-Length），没有大小可校验，
+        # 用"至少 1 MB"挡掉错误页和截断响应
+        if _fetch.fetch_resumable(URL, _RAW, verbose=verbose, timeout=30,
+                                  min_bytes=1_000_000):
             data = json.loads(_RAW.read_text())
             if _is_key_table(data):
                 _save_cache(data)
+                try:
+                    _save_fp(_fetch.remote_fingerprint(URL))
+                except Exception:  # noqa: BLE001
+                    pass
                 return data
+            if verbose:
+                print("  Sudama: 下载的内容不是完整密钥表，丢弃")
     except Exception as exc:  # noqa: BLE001
         if verbose:
             print(f"  Sudama: 下载失败 ({type(exc).__name__})")
@@ -109,6 +174,13 @@ def _refresh_in_background() -> None:
     def run() -> None:
         global _mem
         try:
+            # 远端没变就别重下 18 MB，只把本地时间戳刷新，避免每 6 小时一次满量下载
+            if _unchanged_remotely():
+                cached = _load_cache(allow_stale=True)
+                if cached:
+                    _save_cache(cached)
+                    _mem = cached
+                    return
             data = _download()
             if data:
                 _mem = data
@@ -145,18 +217,21 @@ def load(force: bool = False, verbose: bool = False) -> dict:
             print(f"  Sudama: 下载完成（{len(data):,} 条）")
         _mem = data
         return data
-    # 兜底：断点续传的所有源都失败时，再直连整包试一次（首次使用、没有任何缓存时才走到这）
-    if force or not _CACHE.is_file():
-        try:
-            req = urllib.request.Request(URL, headers={"User-Agent": "Mozilla/5.0"})
-            data = json.loads(urllib.request.urlopen(req, timeout=TIMEOUT).read().decode("utf-8"))
-            if _is_key_table(data):
-                _save_cache(data)
-                _mem = data
-                return data
-        except Exception as exc:  # noqa: BLE001
-            if verbose:
-                print(f"  Sudama: 直连失败 ({type(exc).__name__})")
+    # 兜底：断点续传的所有源都失败时，再直连整包试一次。
+    # ★ 2026-11-07: 这里原来的门控是 `if force or not _CACHE.is_file()` ——
+    #   只要本地有缓存文件就跳过兜底。配合 fetch_resumable 对 chunked 响应
+    #   恒返回 False 的 bug，等于"有缓存就永远不再更新"，缓存冻结了五周。
+    #   现在只要走到这一步（说明 _download 失败了）就试一次直连。
+    try:
+        req = urllib.request.Request(URL, headers={"User-Agent": "Mozilla/5.0"})
+        data = json.loads(urllib.request.urlopen(req, timeout=TIMEOUT).read().decode("utf-8"))
+        if _is_key_table(data):
+            _save_cache(data)
+            _mem = data
+            return data
+    except Exception as exc:  # noqa: BLE001
+        if verbose:
+            print(f"  Sudama: 直连失败 ({type(exc).__name__})")
     stale = _load_cache(allow_stale=True)
     if stale:
         if verbose:
@@ -167,6 +242,21 @@ def load(force: bool = False, verbose: bool = False) -> dict:
         print("  Sudama: 全部失败")
     _mem = {}
     return {}
+
+
+def refresh_if_remote_changed(verbose: bool = False) -> dict | None:
+    """远端变了才真下载；没变返回 None（表示本地已经是最新的）。
+
+    给"搜不到某个新游戏"这条路径用: 先花一次 1 字节的 Range GET 判断远端
+    有没有更新，没更新就说明本地已是最新、这个游戏确实还没被收录 ——
+    省掉 18 MB 的无用下载。
+    """
+    if _unchanged_remotely(verbose):
+        cached = _load_cache(allow_stale=True)
+        if cached:
+            _save_cache(cached)        # 内容没变，只把时间戳推到现在
+        return None
+    return load(force=True, verbose=verbose)
 
 
 def key_for(depot_id: int) -> str | None:

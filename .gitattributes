@@ -1,3 +1,8 @@
 # 脚本在 SteamOS 上运行，必须是 LF；Windows 检出若转成 CRLF，bash 会直接报错（启动器坏 = 游戏模式起不来 Steam）
 *.sh text eol=lf
 scripts/** text eol=lf
+# Python 同理：Windows 上编辑后若带 CRLF 推上去，整个文件 diff 都会变成噪音
+*.py text eol=lf
+*.md text eol=lf
+*.html text eol=lf
+*.toml text eol=lf

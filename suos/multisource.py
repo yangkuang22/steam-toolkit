@@ -52,6 +52,31 @@ MAX_DLC_LOOKUPS = 60
 #: 全零密钥 —— 只能当占位用，绝不能当成真密钥收进 keys
 _ZERO_KEY = "0" * 64
 
+#: 缓存比这个旧，且有内容的 depot 查不到密钥时，才同步刷新密钥库
+MISS_REFRESH_AFTER = 15 * 60
+
+
+def _refresh_stale_sources(verbose: bool) -> dict[str, dict]:
+    """把不新鲜的密钥库同步刷新一次，返回 {源名: 新表}（只含真的拿到新数据的源）。
+
+    远端没变（ETag 一致）时 refresh_if_remote_changed 返回 None —— 说明本地
+    已是最新，缺的密钥确实还没被收录，不必下载。
+    """
+    out: dict[str, dict] = {}
+    for name, mod in (("sudama", sudama), ("community", depotkeys)):
+        try:
+            if mod.age() < MISS_REFRESH_AFTER:
+                continue
+            _log(f"  {name}: 缓存 {mod.age() / 3600:.1f} 小时前，有 depot 缺密钥，"
+                 f"检查远端是否有更新…", verbose)
+            table = mod.refresh_if_remote_changed(verbose=verbose)
+        except Exception as exc:  # noqa: BLE001
+            _log(f"  {name}: 刷新失败 ({type(exc).__name__})", verbose)
+            continue
+        if isinstance(table, dict) and table:
+            out[name] = table
+    return out
+
 
 def _log(msg: str, verbose: bool) -> None:
     if verbose:
@@ -374,19 +399,43 @@ def resolve(appid: int, verbose: bool = True) -> dict | None:
         ("steamunlock_api", server_keys),
     ]
 
-    for dep in all_depots:
-        for src_name, table in lookups:
-            if not isinstance(table, dict):
-                continue
-            key = table.get(str(dep))
-            if key is None:
-                key = table.get(dep)
-            if not _valid_key(key):
-                continue
-            out["keys"][dep] = str(key).lower()
-            if src_name not in out["sources"]["keys"]:
-                out["sources"]["keys"].append(src_name)
-            break
+    def _lookup(deps: list[int]) -> None:
+        for dep in deps:
+            for src_name, table in lookups:
+                if not isinstance(table, dict):
+                    continue
+                key = table.get(str(dep))
+                if key is None:
+                    key = table.get(dep)
+                if not _valid_key(key):
+                    continue
+                out["keys"][dep] = str(key).lower()
+                if src_name not in out["sources"]["keys"]:
+                    out["sources"]["keys"].append(src_name)
+                break
+
+    _lookup(all_depots)
+
+    # ── ④.5 ★ 有内容的 depot 查不到 → 强制刷新一次密钥库再查（新游戏保底）──
+    #   缓存是 stale-while-revalidate：过期时先返回旧的、后台刷新，只保证
+    #   "下一次"能查到。可用户此刻就在搜这个新游戏 —— 实证 4348910 发售于
+    #   10-28，而设备缓存停在 10-03，旧缓存里当然没有。
+    #   所以这里同步刷新，但很克制:
+    #     · 只在【有内容的 depot 缺密钥】时触发（不是每次 resolve 都刷）
+    #     · 缓存足够新（< MISS_REFRESH_AFTER）就不刷，防止对真没收录的游戏反复打
+    #     · 先用 ETag 问远端变了没，没变就不下载（游戏确实还没被收录）
+    missing = [d for d in all_depots if d in content and d not in out["keys"]]
+    if missing:
+        refreshed = _refresh_stale_sources(verbose)
+        for name, table in refreshed.items():
+            lookups[:] = [(n, table if n == name else t) for n, t in lookups]
+        if refreshed:
+            _lookup(missing)
+            recovered = [d for d in missing if d in out["keys"]]
+            _log(f"  密钥库刷新后找回 {len(recovered)}/{len(missing)} 个 depot 的密钥"
+                 + (f": {', '.join(str(d) for d in recovered[:6])}" if recovered else ""),
+                 verbose)
+            out["sources"]["refreshed"] = sorted(refreshed)
 
     # ── 清单钉固信息 ──
     #   pins: 钉到 Lua 的权威 gid（本体视角优先）

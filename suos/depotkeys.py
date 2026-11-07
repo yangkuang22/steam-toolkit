@@ -32,7 +32,8 @@ _CACHE_DIR = Path(os.environ.get("SUOS_CACHE", str(Path.home() / ".cache/suos"))
 CACHE = _CACHE_DIR / "depotkeys.json"
 _META = _CACHE_DIR / "depotkeys.meta.json"   # 下载时间单独存，不动数据文件格式
 
-CACHE_TTL = 7 * 24 * 3600   # 7 天
+CACHE_TTL = 6 * 3600        # 6 小时。新游戏天天出；远端没变时只花一次
+                            # ETag 探测，不会重下 16 MB
 MIN_ENTRIES = 1000          # 少于这个数不可能是完整的社区密钥库
 TIMEOUT = 180
 
@@ -73,15 +74,54 @@ def _read_cache() -> Optional[Dict[str, str]]:
     return data if _is_key_table(data) else None
 
 
-def _write_cache(raw: bytes) -> None:
+def age() -> float:
+    """本地缓存写入至今多少秒；没有可用缓存就返回 inf。"""
+    return float("inf") if _read_cache() is None else _cache_age()
+
+
+def _write_cache(raw: bytes, fp: tuple[str, str, int] | None = None) -> None:
     _CACHE_DIR.mkdir(parents=True, exist_ok=True)
     tmp = CACHE.with_suffix(".json.tmp")
     tmp.write_bytes(raw)
     tmp.replace(CACHE)                      # 原子替换，不留半截文件
+    meta: dict = {"timestamp": time.time()}
+    if fp:
+        meta.update({"etag": fp[0], "last_modified": fp[1], "size": fp[2]})
     try:
-        _META.write_text(json.dumps({"timestamp": time.time()}))
+        _META.write_text(json.dumps(meta))
     except OSError:
         pass
+
+
+def _touch_cache() -> None:
+    """内容没变时只把时间戳往前推，省掉一次 16 MB 下载。"""
+    try:
+        meta = json.loads(_META.read_text()) if _META.is_file() else {}
+    except Exception:  # noqa: BLE001
+        meta = {}
+    meta["timestamp"] = time.time()
+    try:
+        _META.write_text(json.dumps(meta))
+    except OSError:
+        pass
+
+
+def _unchanged_remotely() -> bool:
+    """远端还是上次那份吗？只花一次 Range GET（1 字节）。"""
+    try:
+        meta = json.loads(_META.read_text())
+        old_etag = str(meta.get("etag") or "")
+        old_lm = str(meta.get("last_modified") or "")
+    except Exception:  # noqa: BLE001
+        return False
+    if not (old_etag or old_lm):
+        return False
+    try:
+        from . import fetch as _fetch
+        etag, lm, _ = _fetch.remote_fingerprint(MANIFESTHUB_URLS[0])
+    except Exception:  # noqa: BLE001
+        return False
+    return bool((etag and etag == old_etag) or (lm and lm == old_lm))
 
 
 def _download(verbose: bool = False) -> Optional[Dict[str, str]]:
@@ -95,7 +135,12 @@ def _download(verbose: bool = False) -> Optional[Dict[str, str]]:
                 if verbose:
                     print(f"  社区库: {url[:40]}… 返回的不是完整密钥表")
                 continue
-            _write_cache(raw)
+            try:
+                from . import fetch as _fetch
+                fp = _fetch.remote_fingerprint(url)
+            except Exception:  # noqa: BLE001
+                fp = None
+            _write_cache(raw, fp)
             if verbose:
                 print(f"  社区库: 下载完成（{len(data):,} 条）")
             return data
@@ -118,6 +163,9 @@ def _refresh_in_background() -> None:
     def run() -> None:
         global _mem
         try:
+            if _unchanged_remotely():
+                _touch_cache()      # 内容没变，省掉 16 MB
+                return
             data = _download()
             if data:
                 _mem = data
@@ -161,6 +209,17 @@ def load_community_keys(force: bool = False, verbose: bool = False) -> Dict[str,
         print("  社区库: 全部失败")
     _mem = {}
     return {}
+
+
+def refresh_if_remote_changed(verbose: bool = False) -> Optional[Dict[str, str]]:
+    """远端变了才真下载；没变返回 None（表示本地已经是最新的）。
+
+    和 sudama.refresh_if_remote_changed 同语义，给"搜不到新游戏"的保底路径用。
+    """
+    if _unchanged_remotely():
+        _touch_cache()
+        return None
+    return load_community_keys(force=True, verbose=verbose)
 
 
 def key_for(depotid: int, community: Optional[Dict[str, str]] = None) -> Optional[str]:
