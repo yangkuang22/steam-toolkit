@@ -542,8 +542,18 @@ def _depots_needing_placeholder(r: dict) -> list[int]:
     depots = r.get("depots") or []
     keys_int = {int(k) for k in (r.get("keys") or {}) if str(k).isdigit()}
 
-    # 有内容的 depot（有清单 = 有要解密的数据），绝不写零密钥
+    # 有内容的 depot（有要解密的数据），绝不写零密钥
     content_depots: set[int] = set()
+    # ★ 首选权威来源: multisource 从 appinfo 的 size>0 算出来的集合。
+    #   不能只看"清单下载成功"—— GitHub API 抽风少下一个 .manifest，
+    #   那个 depot 就会从"有内容"误判成"空 depot"，被写全零密钥 →
+    #   Steam 用全零 AES 解出垃圾 → 校验失败/内容仍处于加密状态。
+    #   实证: appid 2696050 的 depot 2696053 就这样被写成了 64 个 0。
+    for dep in (r.get("content_depots") or []):
+        try:
+            content_depots.add(int(dep))
+        except (TypeError, ValueError):
+            continue
     for item in (r.get("manifests") or []):
         try:
             content_depots.add(int(item[0]))
@@ -551,6 +561,12 @@ def _depots_needing_placeholder(r: dict) -> list[int]:
             continue
     for m in re.finditer(r'setManifestid\((\d+),', r.get("lua") or ""):
         content_depots.add(int(m.group(1)))
+    # 已知有权威 gid = 有清单 = 有内容
+    for dep in (r.get("manifest_pins") or {}):
+        try:
+            content_depots.add(int(dep))
+        except (TypeError, ValueError):
+            continue
 
     out: list[int] = []
     for d in depots:
@@ -573,6 +589,94 @@ def _depots_needing_placeholder(r: dict) -> list[int]:
     except Exception:
         pass
     return sorted(set(out))
+
+
+def _prefetch_manifests(appid: int, candidates: dict) -> set[tuple[int, str]]:
+    """把所有已知 (depot, gid) 的清单抓到 depotcache，返回本地已有的集合。
+
+    ★ 为什么一个 depot 可能有多个 gid:
+      本体 appinfo 和 DLC 自身 appinfo 对同一个 depot 可能给出不同的 public gid
+      （实证: appid 2696050 的 depot 3171570 —— 本体说 6273957131003220084，
+       DLC 3171570 自己说 9160537544495656538）。Steam 取哪个取决于它从哪条
+       路径进入下载集合，所以两个清单都放到本地才不会卡在 manifest request code。
+      depotcache 里多放清单没有副作用（Steam 按文件名精确命中）。
+    """
+    from suos import manifests as _mf
+
+    local: set[tuple[int, str]] = set()
+    for dep, gids in (candidates or {}).items():
+        try:
+            dep_i = int(dep)
+        except (TypeError, ValueError):
+            continue
+        for gid in gids or []:
+            gid_s = str(gid)
+            if (DEPOTCACHE / f"{dep_i}_{gid_s}.manifest").is_file():
+                local.add((dep_i, gid_s))
+                continue
+            try:
+                mr = _mf.fetch_manifest(appid, dep_i, int(gid_s))
+            except Exception:  # noqa: BLE001
+                mr = None
+            if mr:
+                try:
+                    _mf.install_manifest(DEPOTCACHE, dep_i, int(gid_s), mr.data)
+                    local.add((dep_i, gid_s))
+                except Exception:  # noqa: BLE001
+                    pass
+    return local
+
+
+def _complete_lua(lua_text: str, r: dict, local: set[tuple[int, str]]) -> tuple[str, list[int]]:
+    """把【有内容但 Lua 里没有】的 depot 补进去，返回 (新 Lua, 补充的 depot)。
+
+    ★ 本次修复的落地点。ManifestHub3 的 Lua 只覆盖本体 appinfo 列出的 depot，
+      但 DLC 可以有自己的 depot（hasdepotsindlc=1）。入库时 addappid 注入了
+      DLC 所有权，Steam 就会把这些 depot 加进下载集合并索要密钥 —— Lua 和
+      config.vdf 里都没有的话，Steam 报
+          Failed to initialize depot <id> (Missing decryption key)
+      然后取消【整个】下载任务。
+
+    setManifestid 只在清单确实已经落到本地时才写：钉固一个拿不到清单的 gid
+    会被 4.95 的硬门槛判为致命，反而让本来能装的游戏装不上。密钥是刚需，
+    钉固只是省掉请求码的优化。
+    """
+    keys = {int(k): v for k, v in (r.get("keys") or {}).items() if str(k).isdigit()}
+    pins = {int(k): str(v) for k, v in (r.get("manifest_pins") or {}).items()
+            if str(k).isdigit()}
+    content = {int(d) for d in (r.get("content_depots") or []) if str(d).isdigit()}
+    # ★ 只补 Valve 当前 appinfo 还认的 depot。ManifestHub3 分支里常留着游戏早期
+    #   已下线的语言 depot（实证: 2696050 的 2696051-2696054），往 Lua 里写它们
+    #   等于复活死 depot。steam_depots 为空说明 appinfo 查不到，这时不收窄，
+    #   退回旧行为。
+    live = {int(d) for d in (r.get("steam_depots") or []) if str(d).isdigit()}
+    if live:
+        content &= live
+
+    added: list[int] = []
+    new_lines: list[str] = []
+    for dep in sorted(content):
+        key = keys.get(dep)
+        if not key:
+            continue        # 没密钥就别写进 Lua，交给占位/如实失败逻辑
+        if re.search(rf"addappid\(\s*{dep}\s*,", lua_text):
+            continue        # 已有带密钥的条目
+        new_lines.append(f'addappid({dep},0,"{key}")')
+        gid = pins.get(dep)
+        if gid and (dep, gid) in local and not re.search(
+                rf"setManifestid\(\s*{dep}\s*,", lua_text):
+            new_lines.append(f'setManifestid({dep},"{gid}")')
+        added.append(dep)
+
+    if not new_lines:
+        return lua_text, []
+
+    block = "\n".join(new_lines) + "\n"
+    marker = "\n-- DLC"
+    if marker in lua_text:
+        i = lua_text.index(marker)
+        return lua_text[:i].rstrip("\n") + "\n" + block + lua_text[i:], added
+    return lua_text.rstrip("\n") + "\n" + block, added
 
 
 # 所有权只走 Lua（addappid）。config.toml 的 AppIds / AdditionalApps 不再写入：
@@ -772,6 +876,25 @@ def install(appid: int, include_dlc: bool = False) -> dict:
                         res["steps"].append(f"✓ 同时下载了 {len(fresh)} 个最新清单")
         except Exception as exc:  # noqa: BLE001
             warn(f"对齐最新版本失败（保留原版本）: {str(exc)[:60]}")
+
+    # ── 4.85 ★ 补齐 DLC 自有 depot（本次修复）──
+    #   ManifestHub3 的 Lua 只覆盖本体 appinfo 列出的 depot。DLC 可以有自己的
+    #   depot（appinfo 的 hasdepotsindlc=1），上面 4.5 的 addappid 注入了 DLC
+    #   所有权，Steam 随即把这些 depot 加进下载集合并索要密钥 —— 缺一个就报
+    #   "Failed to initialize depot <id> (Missing decryption key)" 并取消整个
+    #   下载任务（用户看到"内容仍处于加密状态"）。
+    #   实证: Yarimono(2696050) 的 DLC 3593650 自带 depot 3593650。
+    try:
+        local_manifests = _prefetch_manifests(
+            appid, r.get("manifest_candidates") or {})
+        lua_text, added = _complete_lua(lua_text, r, local_manifests)
+        if added:
+            res["steps"].append(
+                f"✓ 补齐 {len(added)} 个 DLC 自有 depot 的密钥/钉固: "
+                + ", ".join(str(d) for d in added[:6])
+                + ("…" if len(added) > 6 else ""))
+    except Exception as exc:  # noqa: BLE001
+        warn(f"补齐 DLC 自有 depot 失败（非致命）: {str(exc)[:60]}")
 
     # ── 4.9 清单本地化兜底（关键：绕开请求码依赖）──
     #   Steam 下载 depot 前会先查本地 depotcache/<depot>_<gid>.manifest：
