@@ -71,6 +71,12 @@ SLSsteam 管理运行时配置（`config.toml`）并通过 Lua 脚本锁定清�
 
 工具经过两轮完整体检（静态审计 + ROG Ally 真机 SSH 实证），已知问题全部修复：
 
+### 2026-11-08 旧 DLC 的文件盖掉新 DLC（SteamOS 真机实证）
+
+- **现象**：Yarimono(2696050) 启动即报 `ReferenceError: NLngStrGet is not defined`，同一份入库数据在 Windows 上正常。
+- **根因**：本体与各 DLC 的 depot 都带同名文件，Steam 只落挂载顺序里最后一个 depot 的版本；挂载顺序在首次加入时按 Lua 里 `addappid` 的顺序登记。补齐 DLC 自有 depot 时是追加到末尾的，DLC1(3171571) 排到了 DLC2(3593650) 后面，250 个文件被旧版盖掉。
+- **修复**：写 Lua 前按优先级重排 depot（新 DLC 放最后）；新增 `check-overlap` 体检。已登记过的游戏需卸载后重新入库再安装。
+
 ### 2026-10-05 下载链路体检（真机验证）
 
 | 问题 | 说明 | 状态 |

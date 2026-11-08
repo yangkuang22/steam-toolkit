@@ -679,6 +679,51 @@ def _complete_lua(lua_text: str, r: dict, local: set[tuple[int, str]]) -> tuple[
     return lua_text.rstrip("\n") + "\n" + block, added
 
 
+_LUA_KEYED = re.compile(r'^\s*addappid\(\s*(\d+)\s*,\s*\d+\s*,\s*"[^"]*"\s*\)\s*$')
+_LUA_PIN = re.compile(r'^\s*setManifestid\(\s*(\d+)\s*,')
+
+
+def _order_lua_depots(lua_text: str) -> tuple[str, bool]:
+    """按优先级重排带密钥的 addappid（连同各自的 setManifestid），返回 (新 Lua, 是否改动)。
+
+    ★ depot 覆盖问题的根因修复。多个 depot 带同名文件时，Steam 落盘的是挂载
+      顺序里【最后】一个含该文件的 depot；挂载顺序在 depot 首次加入时按 Lua 里
+      addappid 的顺序登记，之后一直沿用。_complete_lua 分几轮把 depot 追加到
+      末尾，曾让旧 DLC 排在新 DLC 后面，旧文件盖掉新文件（实证 Yarimono
+      2696050：3171571 被追加在 3593650 之后，游戏启动即 ReferenceError）。
+      这里统一按 depot_overlap.lua_depot_order 排序（与体检用同一个优先级定义）。
+
+    只动带密钥的 addappid 和 setManifestid 两类行，整组插回第一组出现的位置；
+    主 appid 那行、`-- DLC` 段和注释原样保留。已登记过的游戏要卸载重装才会按
+    新顺序重新登记，体检的 check-overlap 会提示这种情况。
+    """
+    from suos import depot_overlap
+
+    groups: dict[int, list[str]] = {}
+    rest: list[str] = []
+    insert_at: int | None = None
+    for line in lua_text.splitlines():
+        m = _LUA_KEYED.match(line) or _LUA_PIN.match(line)
+        if m is None:
+            rest.append(line)
+            continue
+        if insert_at is None:
+            insert_at = len(rest)
+        groups.setdefault(int(m.group(1)), []).append(line)
+    if insert_at is None:
+        return lua_text, False
+
+    block: list[str] = []
+    for depot in depot_overlap.lua_depot_order(groups):
+        lines = groups[depot]
+        block += [ln for ln in lines if _LUA_KEYED.match(ln)]
+        block += [ln for ln in lines if not _LUA_KEYED.match(ln)]
+    new_text = "\n".join(rest[:insert_at] + block + rest[insert_at:])
+    if lua_text.endswith("\n"):
+        new_text += "\n"
+    return new_text, new_text != lua_text
+
+
 # 所有权只走 Lua（addappid）。config.toml 的 AppIds / AdditionalApps 不再写入：
 #   · UseWhitelist=false（默认）时 AppIds 是【黑名单】，往里写等于把游戏拉黑，
 #     只是碰巧被 AdditionalApps 覆盖才没出事；
@@ -1002,6 +1047,9 @@ def install(appid: int, include_dlc: bool = False) -> dict:
         if res["fatal"]:
             res["steps"].append("（有致命失败，未写入/未改动 Lua，避免交付必坏配置）")
         else:
+            lua_text, reordered = _order_lua_depots(lua_text)
+            if reordered:
+                res["steps"].append("✓ 按优先级重排 depot 顺序（新 DLC 的同名文件不会被旧 DLC 盖掉）")
             try:
                 LUA_SLS.mkdir(parents=True, exist_ok=True)
                 LUA_STEAM.mkdir(parents=True, exist_ok=True)

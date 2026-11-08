@@ -21,6 +21,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import webui_core  # noqa: E402
 from suos import cli, depot_overlap as dov, steam  # noqa: E402
 
 APPID = 2696050
@@ -344,6 +345,56 @@ class TestCli(_TmpCase):
                          cli.OVERLAP_INTERNAL_ERROR)
         self.assertEqual(self.run_cli("check-overlap", "--all", "--accept")[0],
                          cli.OVERLAP_INTERNAL_ERROR)
+
+
+# ── Lua 排序（根因修复）───────────────────────────────────────────────
+
+# 掌机 11-07 15:38 实际写出的 Lua：3171571 被追加在 3593650 后面
+LUA_1538 = """addappid(2696050)
+addappid(3171570,0,"006677b4")
+setManifestid(3171570,"6273957131003220084")
+addappid(2696055,0,"25043be4")
+setManifestid(2696055,"4797632950615304316")
+addappid(3593651,0,"cdac6a93")
+setManifestid(3593651,"8139483366419726494")
+addappid(3593650,0,"1b4a0cba")
+setManifestid(3593650,"7850549861192466480")
+addappid(3171571,0,"3ec0a8d4")
+setManifestid(3171571,"3309968121601332384")
+
+-- DLC
+addappid(3171570)
+addappid(3593650)
+"""
+
+
+class TestLuaOrder(unittest.TestCase):
+    def keyed(self, text: str) -> list[int]:
+        return [int(m.group(1)) for line in text.splitlines()
+                if (m := webui_core._LUA_KEYED.match(line))]
+
+    def test_reorders_by_priority(self):
+        new, changed = webui_core._order_lua_depots(LUA_1538)
+        self.assertTrue(changed)
+        self.assertEqual(self.keyed(new), [BASE, DLC1A, DLC1, DLC2A, DLC2B])
+        self.assertEqual(self.keyed(new)[-1], dov.default_priority(self.keyed(new))[0],
+                         "Lua 末位必须是体检认定的最高优先级")
+        lines = new.splitlines()
+        self.assertEqual(lines[0], "addappid(2696050)")
+        for i, line in enumerate(lines):
+            if webui_core._LUA_KEYED.match(line):
+                depot = webui_core._LUA_KEYED.match(line).group(1)
+                self.assertTrue(lines[i + 1].startswith(f"setManifestid({depot},"))
+        self.assertTrue(new.endswith("-- DLC\naddappid(3171570)\naddappid(3593650)\n"))
+        self.assertEqual(sorted(new.splitlines()), sorted(LUA_1538.splitlines()),
+                         "只调换顺序，一行不多一行不少")
+
+    def test_idempotent_and_noop(self):
+        once, _ = webui_core._order_lua_depots(LUA_1538)
+        twice, changed = webui_core._order_lua_depots(once)
+        self.assertEqual((twice, changed), (once, False))
+        plain = "addappid(123)\n-- 没有带密钥的 depot\n"
+        self.assertEqual(webui_core._order_lua_depots(plain), (plain, False))
 
 
 if __name__ == "__main__":
