@@ -108,6 +108,15 @@ echo "--- 11. 启动器日志 ---"
 _launcher_log="$ROOT/logs/launcher.log"
 [ -f "$_launcher_log" ] && tail -3 "$_launcher_log" | sed 's/^/  /' || p "启动器日志" "暂无"
 echo
+echo "--- 12. depot 重叠覆盖（多个 depot 的同名文件是否落对版本）---"
+( cd "$ROOT" && python3 -m suos.cli check-overlap --all --healthcheck )
+case $? in
+    0) ok=$((ok+1)) ;;
+    1) warn=$((warn+1)) ;;
+    2) err=$((err+1)) ;;
+    *) warnf "depot 重叠检查" "检查本身出错（见上方输出）" ;;
+esac
+echo
 echo "=============================================="
 echo " 结果: ✓ $ok 项正常  ⚠ $warn 项警告  ✗ $err 项错误"
 echo "=============================================="

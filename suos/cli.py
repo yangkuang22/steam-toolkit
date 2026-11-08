@@ -387,6 +387,123 @@ def cmd_install_server(paths: steam.SteamPaths, args: argparse.Namespace) -> int
     return _do_install(args, preview_default=True)
 
 
+OVERLAP_INTERNAL_ERROR = 3   # 与 0/1/2（正常/警告/错误）区分，healthcheck.sh 据此计数
+
+
+def _print_overlap_report(rep, limit: int) -> None:
+    from suos.depot_overlap import Status
+
+    print(f"== {rep.appid} {rep.name}")
+    if rep.install_dir:
+        print(f"   安装目录           : {rep.install_dir}")
+    if rep.mount_order:
+        print(f"   挂载顺序(末位胜出) : {' → '.join(map(str, rep.mount_order))}")
+    if rep.priority:
+        print(f"   期望优先级(高→低)  : {' > '.join(map(str, rep.priority))}")
+    for problem in rep.problems:
+        print(f"   ⚠ {problem}")
+    if not rep.findings:
+        print("   ✓ 单 depot，不存在重叠" if len(rep.mount_order) < 2
+              else "   ✓ 没有内容不同的同名文件")
+        return
+
+    n = {s: len(rep.with_status(s)) for s in Status}
+    print(f"   冲突路径 {len(rep.findings)} 个：✓ 正确 {n[Status.OK]}  ✓ 已认可 {n[Status.ACCEPTED]}"
+          f"  ✗ 盖错 {n[Status.WRONG_DEPOT]}  ✗ 缺失 {n[Status.MISSING]}"
+          f"  · 补丁/手改 {n[Status.MODIFIED]}")
+    bad = [f for f in rep.findings if f.status in (Status.WRONG_DEPOT, Status.MISSING)]
+    for f in bad[:limit]:
+        if f.status is Status.MISSING:
+            print(f"     ✗ 缺失  {f.path}  （期望来自 depot {f.expected_depot}）")
+        else:
+            print(f"     ✗ 盖错  {f.path}  期望 {f.expected_depot}，实际 "
+                  f"{'/'.join(map(str, f.actual_depots))}")
+    if len(bad) > limit:
+        print(f"     … 另有 {len(bad) - limit} 个")
+
+    risks = rep.order_risks
+    if risks:
+        print(f"   ⚠ 挂载顺序风险 {len(risks)} 个：验证完整性/更新后，这些文件会换成低优先级版本")
+        if not bad:
+            for f in risks[:limit]:
+                print(f"     ⚠ {f.path}  按当前顺序会落 depot {f.order_winner}，期望 {f.expected_depot}")
+            if len(risks) > limit:
+                print(f"     … 另有 {len(risks) - limit} 个")
+        print("     处理：不要验证完整性；或卸载后用新版工具重新入库再安装（重新登记挂载顺序）")
+    if n[Status.WRONG_DEPOT] or n[Status.MODIFIED]:
+        print(f"   提示：如果是打补丁带来的、且游戏运行正常，"
+              f"运行 check-overlap {rep.appid} --accept 记下当前版本，之后不再报警")
+    print("   结论: " + ("✓ 正常", "⚠ 有风险", "✗ 有文件被旧版本盖掉")[rep.severity])
+
+
+def _overlap_healthcheck(reports: list) -> int:
+    from suos.depot_overlap import Status
+
+    def line(label: str, text: str) -> None:
+        print(f"  {label:<52} {text}")
+
+    shown = 0
+    for rep in reports:
+        label = f"{rep.appid} {rep.name}"[:40]
+        if rep.severity == 2:
+            wrong = len(rep.with_status(Status.WRONG_DEPOT))
+            missing = len(rep.with_status(Status.MISSING))
+            detail = f"{wrong} 个文件被其他 depot 盖错" + (f"，{missing} 个缺失" if missing else "")
+            line(label, f"✗ {detail}（check-overlap {rep.appid} 看详情；补丁所致可 --accept）")
+        elif rep.severity == 1:
+            parts = []
+            if rep.order_risks:
+                parts.append(f"{len(rep.order_risks)} 个文件在验证完整性后会被旧版盖掉，别验证")
+            parts.extend(rep.problems[:1])
+            line(label, "⚠ " + "；".join(parts))
+        else:
+            continue
+        shown += 1
+    if not shown:
+        line("depot 重叠覆盖", f"✓ {len(reports)} 个多 depot 游戏均正常")
+    return max((r.severity for r in reports), default=0)
+
+
+def cmd_check_overlap(paths: steam.SteamPaths, args: argparse.Namespace) -> int:
+    """检查多个 depot 的同名文件是否落对了版本（旧 DLC 盖新 DLC 会导致游戏启动报错）。"""
+    from suos import depot_overlap
+
+    try:
+        priority = ([int(x) for x in args.priority.split(",") if x.strip()]
+                    if args.priority else None)
+    except ValueError:
+        print("✗ --priority 只能是逗号分隔的 depot ID", file=sys.stderr)
+        return OVERLAP_INTERNAL_ERROR
+    if not args.appids and not args.all:
+        print("✗ 需要指定 appid，或用 --all 检查全部多 depot 游戏", file=sys.stderr)
+        return OVERLAP_INTERNAL_ERROR
+    if args.accept and not args.appids:
+        print("✗ --accept 必须明确指定 appid（避免一次认可所有游戏）", file=sys.stderr)
+        return OVERLAP_INTERNAL_ERROR
+    try:
+        appids = args.appids or depot_overlap.multi_depot_apps(paths)
+        if args.accept:
+            for appid in appids:
+                rep = depot_overlap.check_app(paths, appid, priority, hash_all=True)
+                count = depot_overlap.save_accepted(rep)
+                print(f"✓ {appid} {rep.name}: 已把 {count} 个偏离期望版本的文件记为基线"
+                      f" → {depot_overlap.accepted_path(appid)}")
+        reports = [depot_overlap.check_app(paths, a, priority, depot_overlap.load_accepted(a))
+                   for a in appids]
+    except Exception as exc:  # noqa: BLE001 —— 体检不能被单个坏文件打断，如实报错即可
+        print(f"✗ depot 重叠检查出错: {exc}", file=sys.stderr)
+        return OVERLAP_INTERNAL_ERROR
+
+    if args.healthcheck:
+        return _overlap_healthcheck(reports)
+    if not reports:
+        print("✓ 没有挂载了多个 depot 的已安装游戏")
+        return 0
+    for rep in reports:
+        _print_overlap_report(rep, max(1, args.limit))
+    return max(r.severity for r in reports)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="suos", description="Steam Toolkit —— SteamUnlock 的 SteamOS 数据管道")
     parser.add_argument("--steam-root", help="手动指定 Steam 根目录")
@@ -450,6 +567,17 @@ def main(argv: list[str] | None = None) -> int:
     p_isrv.add_argument("--apply", action="store_true", help="真正写入（默认只预演）")
     p_isrv.add_argument("--dlc", action="store_true", help="同时入库全部 DLC")
     p_isrv.set_defaults(func=cmd_install_server)
+
+    p_ov = sub.add_parser("check-overlap",
+                          help="检查多 depot 同名文件是否落对版本（防止旧 DLC 盖掉新 DLC）")
+    p_ov.add_argument("appids", nargs="*", type=int, help="AppID，可多个")
+    p_ov.add_argument("--all", action="store_true", help="检查全部挂载了多个 depot 的已安装游戏")
+    p_ov.add_argument("--priority", help="手动指定优先级（高→低），逗号分隔的 depot ID")
+    p_ov.add_argument("--limit", type=int, default=20, help="每个游戏最多列几条问题（默认 20）")
+    p_ov.add_argument("--healthcheck", action="store_true", help="healthcheck.sh 用的单行输出")
+    p_ov.add_argument("--accept", action="store_true",
+                      help="把当前偏离期望版本的文件记为基线（打完补丁、确认游戏正常后用）")
+    p_ov.set_defaults(func=cmd_check_overlap)
 
     args = parser.parse_args(argv)
     try:

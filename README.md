@@ -128,6 +128,10 @@ SLSsteam 管理运行时配置（`config.toml`）并通过 Lua 脚本锁定清�
 # 健康检查（出问题先跑这个）
 bash scripts/healthcheck.sh
 
+# 多个 depot 的同名文件是否落对版本（游戏启动报 "XXX is not defined" 先跑这个）
+python3 -m suos.cli check-overlap <appid>
+python3 -m suos.cli check-overlap <appid> --accept   # 打完补丁、确认能玩后记下基线
+
 # 检查某游戏有没有数据（不写入）
 python3 -m suos.cli install-mh3 <appid> --dry-run
 
