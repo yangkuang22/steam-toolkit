@@ -315,7 +315,13 @@ bash ~/SteamUnlockOS/scripts/vf.sh upgrade        # 下载 + 替换两个 .so + 
 # 整机重启
 ```
 
-### 9.3 改回包装器指向（如果被还原）
+### 9.3 重装工具链时的注意事项
+
+`bash ~/SteamUnlockOS/install.sh` 会用 `scripts/launcher.sh` **重新生成**两份包装器。
+该模板已改为「存在 vapor-forge 双架构模块时优先用它们，否则回落到 SLSsteam」，
+所以正常重装不会把注入路径改回去。若重装后失效，先 `vf.sh status` 看 LIB 行是什么。
+
+### 9.4 改回包装器指向（如果被还原）
 
 ```bash
 for f in ~/.local/bin/steam ~/.local/share/SLSsteam/path/steam; do

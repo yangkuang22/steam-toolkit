@@ -8,10 +8,18 @@
 #      注入库或 Steam 更新后自动恢复注入
 # ============================================================
 SLSDIR="$HOME/.local/share/SLSsteam"
+VFDIR="$HOME/.local/share/vapor-forge"     # 64 位客户端请用双架构模块
 LIB1="$SLSDIR/library-inject.so"
 LIB2="$SLSDIR/SLSsteam.so"
+if [ -s "$VFDIR/x86_64/libvapor_forge.so" ] && [ -s "$VFDIR/i686/libvapor_forge.so" ]; then
+    LIB1="$VFDIR/i686/libvapor_forge.so"
+    LIB2="$VFDIR/x86_64/libvapor_forge.so"
+fi
 STEAMBIN="/usr/bin/steam"
 STEAMCLIENT="$HOME/.local/share/Steam/ubuntu12_32/steamclient.so"
+if [ -f "$HOME/.local/share/Steam/steamrt64/steamclient.so" ]; then
+    STEAMCLIENT="$HOME/.local/share/Steam/steamrt64/steamclient.so"
+fi
 CONSOLE_LOG="$HOME/.local/share/Steam/logs/console-linux.txt"
 MONITOR_SECS=30
 
