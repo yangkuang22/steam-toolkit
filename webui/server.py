@@ -15,7 +15,7 @@ from urllib.parse import urlparse, parse_qs
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from webui_core import (search, install, uninstall, fetch_dlcs, inventory,  # noqa: E402
-                        update_check_all, update_apply)
+                        update_check_all, update_apply, prewarm_key_tables)
 
 HOST = "127.0.0.1"
 PORT = 8917
@@ -162,6 +162,7 @@ def main() -> None:
         print(f"  启动失败: {exc}", flush=True)
         return
     print(f"  前端已启动: {url}", flush=True)
+    threading.Thread(target=prewarm_key_tables, name="prewarm", daemon=True).start()
     print("  按 Ctrl+C 停止", flush=True)
     if "--no-browser" not in sys.argv:
         threading.Timer(0.6, lambda: webbrowser.open(url)).start()

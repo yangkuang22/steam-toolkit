@@ -41,6 +41,7 @@
 from __future__ import annotations
 
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -56,23 +57,66 @@ _ZERO_KEY = "0" * 64
 MISS_REFRESH_AFTER = 15 * 60
 
 
+#: 单次搜索最多等刷新多久。密钥库镜像连不通时（TCP 无响应）下载会卡住，
+#: 不能让界面跟着一起卡死 —— 超时就用旧表继续，后台线程自己慢慢试，下次生效。
+REFRESH_DEADLINE = 6.0
+
+#: 某个源刷新失败后，这段时间内不再尝试（镜像常年不通时避免每次搜索都白等）。
+REFRESH_RETRY_AFTER = 30 * 60
+_REFRESH_FAILED_AT: dict[str, float] = {}
+
+
+def _call_with_deadline(fn, seconds: float, *args, **kwargs):
+    """在后台线程里调用 fn，最多等 seconds 秒；超时返回 None（线程继续跑）。"""
+    import threading
+
+    box: dict = {}
+
+    def run() -> None:
+        try:
+            box["value"] = fn(*args, **kwargs)
+        except Exception as exc:  # noqa: BLE001
+            box["error"] = exc
+
+    th = threading.Thread(target=run, daemon=True, name="refresh-deadline")
+    th.start()
+    th.join(seconds)
+    if "error" in box:
+        raise box["error"]
+    return box.get("value")
+
+
 def _refresh_stale_sources(verbose: bool) -> dict[str, dict]:
-    """把不新鲜的密钥库同步刷新一次，返回 {源名: 新表}（只含真的拿到新数据的源）。
+    """把不新鲜的密钥库刷新一次，返回 {源名: 新表}（只含真的拿到新数据的源）。
 
     远端没变（ETag 一致）时 refresh_if_remote_changed 返回 None —— 说明本地
     已是最新，缺的密钥确实还没被收录，不必下载。
+
+    ★ 每个源都有 REFRESH_DEADLINE 的等待上限：镜像不可达时只是"这次没刷到"，
+      不会把搜索/入库界面拖到几十秒以上。
     """
     out: dict[str, dict] = {}
     for name, mod in (("sudama", sudama), ("community", depotkeys)):
         try:
             if mod.age() < MISS_REFRESH_AFTER:
                 continue
+            failed_at = _REFRESH_FAILED_AT.get(name, 0.0)
+            if failed_at and (time.time() - failed_at) < REFRESH_RETRY_AFTER:
+                _log(f"  {name}: 上次刷新失败，{int((REFRESH_RETRY_AFTER - (time.time() - failed_at)) / 60)} 分钟内不再重试", verbose)
+                continue
             _log(f"  {name}: 缓存 {mod.age() / 3600:.1f} 小时前，有 depot 缺密钥，"
                  f"检查远端是否有更新…", verbose)
-            table = mod.refresh_if_remote_changed(verbose=verbose)
+            table = _call_with_deadline(
+                mod.refresh_if_remote_changed, REFRESH_DEADLINE, verbose=verbose)
+            if table is None:
+                _log(f"  {name}: 刷新超时（{REFRESH_DEADLINE:.0f}s），先用旧表", verbose)
+                _REFRESH_FAILED_AT[name] = time.time()
         except Exception as exc:  # noqa: BLE001
             _log(f"  {name}: 刷新失败 ({type(exc).__name__})", verbose)
+            _REFRESH_FAILED_AT[name] = time.time()
             continue
+        else:
+            _REFRESH_FAILED_AT.pop(name, None)
         if isinstance(table, dict) and table:
             out[name] = table
     return out

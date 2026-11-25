@@ -45,22 +45,67 @@ def _backup(paths: list[Path], tag: str) -> Path:
 #  搜索
 # ══════════════════════════════════════════════════════════════
 
+_STORE_NAME_DOWN_UNTIL = 0.0   # 商店 API 连不上时熔断，避免每次搜索白等
+
+
 def _steam_name(appid: int) -> str | None:
-    """从 Steam 商店 API 拿游戏名（中文优先）"""
+    """从 Steam 商店 API 拿游戏名（中文优先）。
+
+    部分网络下 store.steampowered.com 的 TCP 连接直接超时（本机实测 8 秒仍
+    连不上）。这里做两件事：单次超时压到 4 秒；一旦超时就熔断 10 分钟，
+    直接返回 None，让调用方使用本地/镜像数据源提供的名字。
+    """
+    global _STORE_NAME_DOWN_UNTIL
+    if time.monotonic() < _STORE_NAME_DOWN_UNTIL:
+        return None
     import urllib.request
     for lang in ("schinese", "english"):
         try:
             url = f"https://store.steampowered.com/api/appdetails?appids={appid}&l={lang}"
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            d = json.loads(urllib.request.urlopen(req, timeout=15).read())
+            d = json.loads(urllib.request.urlopen(req, timeout=4).read())
             info = d.get(str(appid), {})
             if info.get("success"):
                 name = info["data"].get("name")
                 if name:
                     return name
         except Exception:
-            continue
+            _STORE_NAME_DOWN_UNTIL = time.monotonic() + 600
+            break
     return None
+
+
+#: 同一 appid 的解析结果缓存 10 分钟。多源解析要联网（steamcmd / ManifestHub3），
+#: 实测 25-40 秒；用户反复点"搜索"时没必要每次都重来。
+_RESOLVE_CACHE: dict[int, tuple[float, dict]] = {}
+_RESOLVE_TTL = 600.0
+
+
+def _resolve_cached(appid: int):
+    from suos import multisource
+    hit = _RESOLVE_CACHE.get(appid)
+    if hit and (time.monotonic() - hit[0]) < _RESOLVE_TTL:
+        return hit[1]
+    r = multisource.resolve(appid, verbose=False)
+    if r:
+        _RESOLVE_CACHE[appid] = (time.monotonic(), r)
+    return r
+
+
+def prewarm_key_tables() -> None:
+    """后台预热密钥表：把磁盘缓存解析进内存；缓存过期时会顺带触发后台刷新。
+
+    这样第一次搜索不必等 sudama/community 两张表首次解析，也避免"新游戏查不到"
+    时才发现缓存还停在几天前。
+    """
+    from suos import depotkeys, sudama
+    for name, fn in (("sudama", sudama.load),
+                     ("community", depotkeys.load_community_keys)):
+        try:
+            table = fn() or {}
+            _log(f"预热密钥表 {name}: {len(table):,} 条")
+        except Exception as exc:  # noqa: BLE001
+            _log(f"预热密钥表 {name} 失败: {type(exc).__name__}")
 
 
 def search(appid: int) -> dict:
@@ -89,12 +134,9 @@ def search(appid: int) -> dict:
     lua = LUA_SLS / f"{appid}.lua"
     out["installed"] = lua.is_file()
 
-    # 名字（Steam API）
-    out["name"] = _steam_name(appid)
-
-    # 数据源解析
+    # 数据源解析（先走本地/镜像数据源；商店 API 连不通时不再阻塞搜索）
     try:
-        r = multisource.resolve(appid, verbose=False)
+        r = _resolve_cached(appid)
     except Exception as exc:  # noqa: BLE001
         r = None
         out["message"] = f"数据源查询失败: {str(exc)[:100]}"
@@ -105,6 +147,10 @@ def search(appid: int) -> dict:
         out["depot_count"] = len(out["keys"])
         if r.get("name") and not out["name"]:
             out["name"] = r["name"]
+
+    # 名字：本地数据源没给，再问 Steam 商店 API（带熔断，最快 0 秒返回）
+    if not out["name"]:
+        out["name"] = _steam_name(appid)
 
     # 兜底：只在【已知的 depot 列表】里查密钥。
     # 注意：绝不能靠 appid 前缀猜 depot（9999999 会匹配到任何 99999* 的 depot
@@ -137,7 +183,8 @@ def search(appid: int) -> dict:
         out["found"] = True
         out["message"] = "找到数据"
     else:
-        out["message"] = "没有这个游戏的数据（三个密钥库都没有收录）"
+        out["message"] = ("没查到（三个密钥库都没有收录）。"
+                          "若这是刚发售的游戏，密钥库可能正在后台更新，约 1 分钟后重试一次")
 
     return out
 
@@ -167,7 +214,7 @@ def fetch_dlcs(appid: int) -> list[int]:
     try:
         url = f"http://auth1.caigamer.cn/GetAppinfo/{appid}"
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        raw = urllib.request.urlopen(req, timeout=30).read()
+        raw = urllib.request.urlopen(req, timeout=8).read()
         txt = rc4.rc4(rc4.RC4_KEY, raw).decode("utf-8", "replace")
         d = ast.literal_eval(txt)
         cfg = d.get("config")
